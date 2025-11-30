@@ -1,11 +1,11 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
 
-# PyTorch (CPU)
 torch==2.2.0
 torchvision==0.17.0
 torchaudio==2.2.0
--f https://download.pytorch.org/whl/cpu
 
 supabase==2.0.3
 pydantic==2.5.0
