@@ -1,10 +1,10 @@
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
 
-# Lightweight CPU PyTorch (NO CUDA, tiny build)
-torch==2.1.2+cpu
-torchvision==0.16.2+cpu
-torchaudio==2.1.2+cpu
+# PyTorch CPU lightweight wheels for deployment
+torch==2.2.0+cpu
+torchvision==0.17.0+cpu
+torchaudio==2.2.0+cpu
 -f https://download.pytorch.org/whl/cpu
 
 supabase==2.0.3
