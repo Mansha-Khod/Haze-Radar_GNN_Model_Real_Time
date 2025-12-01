@@ -1,7 +1,6 @@
 torch==2.2.0
 torchvision==0.17.0
 torchaudio==2.2.0
-pyg-lib==0.4.0
 torch-geometric==2.5.3
 
 fastapi
@@ -11,4 +10,3 @@ numpy
 requests
 supabase
 apscheduler
-
