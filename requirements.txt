@@ -5,10 +5,10 @@ torchvision==0.17.0+cpu
 torchaudio==2.2.0+cpu
 torch-geometric==2.5.3
 
+numpy<2
+pandas
+requests
 fastapi
 uvicorn
-pandas
-numpy
-requests
 supabase
 apscheduler
