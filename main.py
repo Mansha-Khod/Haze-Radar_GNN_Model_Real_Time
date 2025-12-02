@@ -160,9 +160,35 @@ class DataPipeline:
         return edges
 
     def prepare_realtime_features(self):
-        features = torch.tensor(self.cities_df[self.config.FEATURE_COLS].fillna(0).values, dtype=torch.float32)
-        features = (features - self.feature_mean) / self.feature_std
-        return features, self.edge_index
+    weather_resp = self.supabase.table("gnn_training_data").select(
+        "city, temperature, humidity, wind_speed, wind_direction, avg_fire_confidence, upwind_fire_count, population_density, current_aqi"
+    ).order("timestamp", desc=True).limit(len(self.city_to_idx)).execute()
+
+    df = pd.DataFrame(weather_resp.data)
+
+    for col in ["temperature", "humidity", "wind_speed", "wind_direction", 
+                "avg_fire_confidence", "upwind_fire_count", 
+                "population_density", "current_aqi"]:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    features = []
+    for city in self.cities_df['city']:
+        row = df[df["city"] == city]
+        if len(row) == 0:
+            features.append([25,70,5,90,0,0,1000,50])  
+            continue
+
+        row = row.iloc[0]
+        features.append([
+            row.temperature, row.humidity, row.wind_speed, row.wind_direction,
+            row.avg_fire_confidence, row.upwind_fire_count,
+            row.population_density, row.current_aqi
+        ])
+
+    X = torch.tensor(features, dtype=torch.float32)
+    X = (X - self.feature_mean) / self.feature_std
+    return X, self.edge_index
+
 
 # -------------------- Prediction Engine --------------------
 class PredictionEngine:
