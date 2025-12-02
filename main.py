@@ -88,7 +88,7 @@ class DataPipeline:
         self.feature_std = None
 
     def initialize(self):
-        logger.info("📍 Initializing data pipeline...")
+        logger.info(" Initializing data pipeline...")
         self._load_cache()
         if self.edge_index is None or len(self.city_to_idx) == 0:
             self._build_from_database()
@@ -104,7 +104,7 @@ class DataPipeline:
                     self.edge_index = torch.tensor(cache['edges'], dtype=torch.long).t().contiguous()
                     self.feature_mean = torch.tensor(cache['feature_mean'], dtype=torch.float32)
                     self.feature_std = torch.tensor(cache['feature_std'], dtype=torch.float32)
-                    logger.info("✅ Loaded graph cache")
+                    logger.info("Loaded graph cache")
             except Exception as e:
                 logger.warning(f"Failed to load cache: {e}")
 
@@ -118,10 +118,10 @@ class DataPipeline:
         }
         with open(self.config.GRAPH_CACHE, 'w') as f:
             json.dump(cache, f)
-        logger.info("💾 Saved graph cache")
+        logger.info("Saved graph cache")
 
     def _build_from_database(self):
-        logger.info("📦 Building graph from Supabase...")
+        logger.info(" Building graph from Supabase...")
         response = self.supabase.table("gnn_training_data").select("*").execute()
         df = pd.DataFrame(response.data).drop_duplicates(subset=['city']).reset_index(drop=True)
         if df.empty:
@@ -273,7 +273,7 @@ def update_predictions():
         preds = predictor.predict_current()
         try:
             pipeline.supabase.table("realtime_predictions").upsert(preds).execute()
-            logger.info(f"✅ Updated {len(preds)} predictions")
+            logger.info(f"Updated {len(preds)} predictions")
         except Exception as e:
             logger.error(f"Failed to save predictions: {e}")
     except Exception as e:
@@ -308,12 +308,12 @@ async def startup_event():
     model = RealtimeHazeGNN(in_feats=len(config.FEATURE_COLS)).to(device)
     if os.path.exists(config.MODEL_PATH):
         model.load_state_dict(torch.load(config.MODEL_PATH,map_location=device))
-        logger.info("✅ Model loaded successfully")
+        logger.info(" Model loaded successfully")
     predictor = PredictionEngine(model, pipeline, device)
     update_predictions()
     scheduler.add_job(update_predictions,'interval',seconds=config.UPDATE_INTERVAL)
     scheduler.start()
-    logger.info("🚀 API ready!")
+    logger.info(" API ready!")
 
 @app.get("/", response_model=HealthResponse)
 async def root():
