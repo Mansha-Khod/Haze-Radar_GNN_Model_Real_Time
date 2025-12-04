@@ -357,6 +357,61 @@ async def stats():
         "graph_edges": predictor.pipeline.edge_index.shape[1],
         "model_params": sum(p.numel() for p in predictor.model.parameters())
     }
+from fastapi import Query
+import requests
+
+@app.get("/predict_future")
+async def predict_future(city: str = Query(...), hours: int = Query(3)):
+    """
+    Predict PM2.5 for a future time using forecast weather input.
+    Hours: 1-24 by default
+    """
+
+    try:
+        
+        row = self.cities_df[self.cities_df["city"] == city].iloc[0]
+        lat, lon = row["latitude"], row["longitude"]
+
+        
+        forecast_url = (
+            f"https://api.open-meteo.com/v1/forecast?"
+            f"latitude={lat}&longitude={lon}&hourly=temperature_2m,relativehumidity_2m,"
+            f"windspeed_10m,winddirection_10m&forecast_days=2"
+        )
+        resp = requests.get(forecast_url).json()
+
+        index = hours 
+
+        
+        features = [
+            resp["hourly"]["temperature_2m"][index],
+            resp["hourly"]["relativehumidity_2m"][index],
+            resp["hourly"]["windspeed_10m"][index],
+            resp["hourly"]["winddirection_10m"][index],
+            0,   
+            0,   
+            row["population_density"],
+            row["current_aqi"]
+        ]
+
+        
+        X = torch.tensor([features], dtype=torch.float32)
+        X = (X - self.feature_mean) / self.feature_std
+
+        
+        with torch.no_grad():
+            pred = self.model(X, self.edge_index)[0].item()
+
+        return {
+            "city": city,
+            "hours_ahead": hours,
+            "predicted_pm25": round(pred, 3),
+            "latitude": lat,
+            "longitude": lon
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
 
 if __name__=="__main__":
     import uvicorn
