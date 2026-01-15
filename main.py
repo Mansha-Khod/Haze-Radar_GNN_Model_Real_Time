@@ -298,31 +298,54 @@ def build_72h_forecast(
         all_features = []
 
         for _, row in pipeline.cities_df.iterrows():
+            live = current_map.get(row["city"])
+        
+            # ---------- Selected city ----------
             if row["city"] == city:
-                # Selected city evolves with weather + last hour PM2.5
+                if live:
+                    fire = live.get("avg_fire_confidence", 0)
+                    upwind = live.get("upwind_fire_count", 0)
+                    pop = live.get("population_density", 1000)
+                else:
+                    fire, upwind, pop = 0, 0, 1000
+        
                 all_features.append([
                     temp,
                     humidity,
                     wind_speed,
                     wind_dir,
-                    row.get("avg_fire_confidence", 0),
-                    row.get("upwind_fire_count", 0),
-                    row.get("population_density", 1000),
+                    fire,
+                    upwind,
+                    pop,
                     pm25_to_aqi(prev_pm25)
                 ])
+        
+            # ---------- Other cities ----------
             else:
-                # Other cities stay at live state
-                live = current_map.get(row["city"])
+                if live:
+                    fire = live.get("avg_fire_confidence", 0)
+                    upwind = live.get("upwind_fire_count", 0)
+                    pop = live.get("population_density", 1000)
+                    aqi = pm25_to_aqi(live["predicted_pm25"])
+                    temp2 = live["temperature"]
+                    hum2 = live["humidity"]
+                    ws2 = live["wind_speed"]
+                    wd2 = live["wind_direction"]
+                else:
+                    fire, upwind, pop = 0, 0, 1000
+                    aqi = 50
+                    temp2, hum2, ws2, wd2 = 25, 70, 5, 90
+        
                 all_features.append([
-                    row.get("temperature", 25),
-                    row.get("humidity", 70),
-                    row.get("wind_speed", 5),
-                    row.get("wind_direction", 90),
-                    row.get("avg_fire_confidence", 0),
-                    row.get("upwind_fire_count", 0),
-                    row.get("population_density", 1000),
-                    pm25_to_aqi(live["predicted_pm25"]) if live else row.get("current_aqi", 50)
+                    temp2, hum2, ws2, wd2,
+                    fire, upwind, pop,
+                    aqi
                 ])
+
+
+
+
+
 
         X = torch.tensor(all_features, dtype=torch.float32)
         X = (X - pipeline.feature_mean) / pipeline.feature_std
