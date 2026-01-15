@@ -278,7 +278,10 @@ def build_72h_forecast(
             weather[key] = weather[key] + [weather[key][-1]] * (72 - len(weather[key]))
 
     # Get live predictions for all cities
-    current_preds = predictor.last_predictions or predictor.predict_current()
+    if predictor.last_predictions is None:
+        raise RuntimeError("Predictions not initialized")
+
+    current_preds = predictor.last_predictions
     current_map = {p["city"]: p for p in current_preds}
 
     # Get city static data
@@ -318,7 +321,7 @@ def build_72h_forecast(
                     row.get("avg_fire_confidence", 0),
                     row.get("upwind_fire_count", 0),
                     row.get("population_density", 1000),
-                    pm25_to_aqi(live["predicted_pm25"]) if live else 50
+                    pm25_to_aqi(live["predicted_pm25"]) if live else row.get("current_aqi", 50)
                 ])
 
         X = torch.tensor(all_features, dtype=torch.float32)
@@ -365,26 +368,32 @@ class PredictionEngine:
     def predict_current(self) -> List[Dict]:
         X, edge_index = self.pipeline.prepare_realtime_features()
         X = X.to(self.device)
+
         with torch.no_grad():
             pred, uncertainty = self.model(X, edge_index)
+
         results = []
         for idx, city in enumerate(self.pipeline.cities_df['city']):
             city_data = self.pipeline.cities_df.iloc[idx]
             pm25 = float(pred[idx].cpu().numpy())
             unc = float(uncertainty[idx].cpu().numpy())
+
             results.append({
                 'city': city,
                 'latitude': float(city_data['latitude']),
                 'longitude': float(city_data['longitude']),
-                'predicted_pm25': max(0, pm25),
+                'predicted_pm25': max(1, pm25),
                 'uncertainty': unc,
                 'aqi': pm25_to_aqi(pm25),
                 'aqi_category': pm25_to_category(pm25),
                 'timestamp': datetime.now().isoformat()
             })
+
         self.last_predictions = results
         self.last_update = datetime.now()
         return results
+
+
 
 # -------------------- FastAPI Setup --------------------
 app = FastAPI(title="HazeRadar API", version="2.0.0")
@@ -466,13 +475,17 @@ async def root():
 
 @app.get("/api/predictions/current", response_model=List[PredictionResponse])
 async def get_current_predictions():
-    """Get current predictions for all cities"""
-    return predictor.last_predictions or predictor.predict_current()
+    if predictor.last_predictions is None:
+        raise HTTPException(503, "Predictions not ready yet")
+    return predictor.last_predictions
 
 @app.get("/api/predictions/city/{city_name}", response_model=PredictionResponse)
 async def get_city_prediction(city_name: str):
     """Get current prediction for a specific city"""
-    preds = predictor.last_predictions or predictor.predict_current()
+    if predictor.last_predictions is None:
+        raise HTTPException(503, "Predictions not ready yet")
+    preds = predictor.last_predictions
+
     for p in preds:
         if p['city'].lower() == city_name.lower():
             return p
@@ -501,7 +514,10 @@ async def forecast_city(city: str):
     city_data = city_match.iloc[0]
     lat, lon = city_data["latitude"], city_data["longitude"]
     weather = get_future_weather(lat, lon)
-    current_preds = predictor.last_predictions or predictor.predict_current()
+    if predictor.last_predictions is None:
+        raise HTTPException(503, "Predictions not ready yet")
+    current_preds = predictor.last_predictions
+
     base_pm25 = None
 
     for p in current_preds:
