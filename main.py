@@ -2,7 +2,7 @@
 HazeRadar Real-Time API Backend (Railway Deployment)
 ---------------------------------------------------
 """
-
+from urllib.parse import unquote
 import os
 import json
 import torch
@@ -255,50 +255,86 @@ class DataPipeline:
         return X, self.edge_index
 
 # -------------------- 72-Hour Forecast Builder --------------------
-def build_72h_forecast(model, pipeline: DataPipeline, city: str, weather: Dict, base_pm25: float, device: torch.device) -> List[Dict]:
+def build_72h_forecast(
+    model,
+    pipeline: DataPipeline,
+    city: str,
+    weather: Dict,
+    base_pm25: float,
+    device: torch.device,
+    predictor
+) -> List[Dict]:
     """
-    Build 72-hour forecast using GNN predictions with future weather data.
-    Each hour uses the previous hour's PM2.5 for temporal consistency.
-    Handles device placement and pads weather if <72 hours.
+    Build 72-hour forecast using full-city GNN.
+    Selected city evolves using future weather.
+    Other cities stay at current state for plume propagation.
     """
+
     forecast = []
-    
-    # Pad weather if needed
+
+    # Pad weather if Open-Meteo returns less than 72 hours
     for key in ["temperature_2m", "relative_humidity_2m", "wind_speed_10m", "wind_direction_10m"]:
         if len(weather[key]) < 72:
             weather[key] = weather[key] + [weather[key][-1]] * (72 - len(weather[key]))
-    
-    # Get city data
-    city_data = pipeline.cities_df[pipeline.cities_df['city'] == city].iloc[0]
-    
-    # Start with previous PM2.5 (or base_pm25)
+
+    # Get live predictions for all cities
+    current_preds = predictor.last_predictions or predictor.predict_current()
+    current_map = {p["city"]: p for p in current_preds}
+
+    # Get city static data
+    city_data = pipeline.cities_df[pipeline.cities_df["city"] == city].iloc[0]
+
     prev_pm25 = base_pm25
-    
+
     for t in range(72):
         temp = weather["temperature_2m"][t]
         humidity = weather["relative_humidity_2m"][t]
         wind_speed = weather["wind_speed_10m"][t]
         wind_dir = weather["wind_direction_10m"][t]
-        
-        fires = float(city_data.get('avg_fire_confidence', 0))
-        upwind_fires = float(city_data.get('upwind_fire_count', 0))
-        population = float(city_data.get('population_density', 1000))
-        
-        # Features include previous hour PM2.5 converted to AQI
-        features = torch.tensor([[temp, humidity, wind_speed, wind_dir,
-                                  fires, upwind_fires, population, pm25_to_aqi(prev_pm25)]], dtype=torch.float32)
-        
-        features = (features - pipeline.feature_mean) / pipeline.feature_std
-        features = features.to(device)
-        
+
+        all_features = []
+
+        for _, row in pipeline.cities_df.iterrows():
+            if row["city"] == city:
+                # Selected city evolves with weather + last hour PM2.5
+                all_features.append([
+                    temp,
+                    humidity,
+                    wind_speed,
+                    wind_dir,
+                    row.get("avg_fire_confidence", 0),
+                    row.get("upwind_fire_count", 0),
+                    row.get("population_density", 1000),
+                    pm25_to_aqi(prev_pm25)
+                ])
+            else:
+                # Other cities stay at live state
+                live = current_map.get(row["city"])
+                all_features.append([
+                    row.get("temperature", 25),
+                    row.get("humidity", 70),
+                    row.get("wind_speed", 5),
+                    row.get("wind_direction", 90),
+                    row.get("avg_fire_confidence", 0),
+                    row.get("upwind_fire_count", 0),
+                    row.get("population_density", 1000),
+                    pm25_to_aqi(live["predicted_pm25"]) if live else 50
+                ])
+
+        X = torch.tensor(all_features, dtype=torch.float32)
+        X = (X - pipeline.feature_mean) / pipeline.feature_std
+        X = X.to(device)
+
         with torch.no_grad():
-            pm25_pred, uncertainty = model(features, pipeline.edge_index)
-            pm25 = float(pm25_pred[0].cpu().numpy())
-            unc = float(uncertainty[0].cpu().numpy())
-        
+            pred, uncertainty = model(X, pipeline.edge_index)
+
+        city_idx = pipeline.city_to_idx[city]
+        pm25 = float(pred[city_idx].cpu().numpy())
+        unc = float(uncertainty[city_idx].cpu().numpy())
+
         pm25 = max(1.0, pm25)
         aqi = pm25_to_aqi(pm25)
-        
+
         forecast.append({
             "hour": t,
             "temperature": round(temp, 1),
@@ -310,11 +346,11 @@ def build_72h_forecast(model, pipeline: DataPipeline, city: str, weather: Dict, 
             "category": pm25_to_category(pm25),
             "timestamp": (datetime.now() + timedelta(hours=t)).isoformat()
         })
-        
-        # Feed this hour's PM2.5 into next hour
+
         prev_pm25 = pm25
-    
+
     return forecast
+
 
 # -------------------- Prediction Engine --------------------
 class PredictionEngine:
@@ -446,46 +482,55 @@ async def get_city_prediction(city_name: str):
             return p
     raise HTTPException(status_code=404, detail=f"City '{city_name}' not found")
 
+
+
 @app.get("/api/forecast/{city}", response_model=List[ForecastHourResponse])
 async def forecast_city(city: str):
     """
     Get 72-hour forecast using GNN with future weather data.
     Returns array of hourly predictions for frontend slider.
     """
-    # Find city
-    city_match = pipeline.cities_df[pipeline.cities_df['city'].str.lower() == city.lower()]
+
+    
+    city = unquote(city)
+
+    
+    city_match = pipeline.cities_df[
+        pipeline.cities_df["city"].str.lower() == city.lower()
+    ]
+
     if city_match.empty:
         raise HTTPException(status_code=404, detail=f"City '{city}' not found")
-    
+
     city_data = city_match.iloc[0]
-    lat, lon = city_data['latitude'], city_data['longitude']
-    
-    # Get 72-hour weather forecast
+    lat, lon = city_data["latitude"], city_data["longitude"]
     weather = get_future_weather(lat, lon)
-    
-    # Get current PM2.5 as baseline
     current_preds = predictor.last_predictions or predictor.predict_current()
     base_pm25 = None
+
     for p in current_preds:
-        if p['city'].lower() == city.lower():
-            base_pm25 = p['predicted_pm25']
+        if p["city"].lower() == city.lower():
+            base_pm25 = p["predicted_pm25"]
             break
-    
+
     if base_pm25 is None:
         logger.warning(f"Using default PM2.5 for {city}")
         base_pm25 = 40.0
+
     
-    # Build proper forecast
     forecast_data = build_72h_forecast(
-        predictor.model, 
-        pipeline, 
-        city_data['city'],
-        weather, 
-        base_pm25,
-        device
-    )
-    
+    predictor.model,
+    pipeline,
+    city_data["city"],
+    weather,
+    base_pm25,
+    device,
+    predictor
+)
+
+
     return forecast_data
+
 
 @app.post("/api/update")
 async def manual_update(background_tasks: BackgroundTasks):
