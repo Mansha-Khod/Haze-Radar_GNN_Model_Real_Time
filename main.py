@@ -401,11 +401,7 @@ def update_predictions():
     try:
         logger.info("Updating predictions...")
         preds = predictor.predict_current()
-        try:
-            pipeline.supabase.table("realtime_predictions").upsert(preds, on_conflict="city").execute()
-            logger.info(f"Updated {len(preds)} predictions")
-        except Exception as e:
-            logger.error(f"Failed to save predictions: {e}")
+        logger.info(f"Updated {len(preds)} predictions (in-memory)")
     except Exception as e:
         logger.error(f"Prediction update failed: {e}")
 
