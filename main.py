@@ -431,17 +431,44 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
 
 pipeline = None
 predictor = None
+forecast_cache = {}
 scheduler = BackgroundScheduler()
 device = torch.device("cpu")
 
 def update_predictions():
-    global predictor
+    global predictor, forecast_cache
     try:
         logger.info("Updating predictions...")
         preds = predictor.predict_current()
-        logger.info(f"Updated {len(preds)} predictions (in-memory)")
+
+        new_cache = {}
+
+        for _, row in pipeline.cities_df.iterrows():
+            city = row["city"]
+            lat, lon = row["latitude"], row["longitude"]
+
+            weather = get_future_weather(lat, lon)
+            base_pm25 = next(p["predicted_pm25"] for p in preds if p["city"] == city)
+
+            full = build_72h_forecast(
+                predictor.model,
+                pipeline,
+                city,
+                weather,
+                base_pm25,
+                device,
+                predictor
+            )
+
+            new_cache[city.lower()] = full
+
+        forecast_cache.clear()
+        forecast_cache.update(new_cache)
+        logger.info("Updated predictions and forecasts")
+
     except Exception as e:
         logger.error(f"Prediction update failed: {e}")
+
 
 # -------------------- API Models --------------------
 class PredictionResponse(BaseModel):
@@ -532,32 +559,20 @@ async def forecast_city(city: str):
         raise HTTPException(status_code=404, detail=f"City '{city}' not found")
 
     city_data = city_match.iloc[0]
-    lat, lon = city_data["latitude"], city_data["longitude"]
-    weather = get_future_weather(lat, lon)
+    
 
     if predictor.last_predictions is None:
         raise HTTPException(503, "Predictions not ready yet")
 
-    base_pm25 = next(
-        (p["predicted_pm25"] for p in predictor.last_predictions
-         if p["city"].lower() == city.lower()), 40.0
-    )
-
     # Full 72-hour forecast internally
-    forecast_data = build_72h_forecast(
-        predictor.model,
-        pipeline,
-        city_data["city"],
-        weather,
-        base_pm25,
-        device,
-        predictor
-    )
-
-    # Slider-ready 12h intervals
+    city_key = city.lower()
+    if city_key not in forecast_cache:
+        raise HTTPException(503, "Forecast not ready yet")
+    
+    forecast_data = forecast_cache[city_key]
     slider_data = [f for i, f in enumerate(forecast_data) if i % 12 == 0]
-
     return slider_data
+
 
 
 
