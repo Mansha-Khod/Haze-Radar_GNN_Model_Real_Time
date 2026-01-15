@@ -267,27 +267,33 @@ def build_72h_forecast(
     """
     Build 72-hour forecast using full-city GNN.
     Selected city evolves using future weather.
-    Other cities stay at current state for plume propagation.
+    Other cities use safe default values.
     """
 
     forecast = []
 
-    # Pad weather if Open-Meteo returns less than 72 hours
+    # Pad weather if less than 72 hours
     for key in ["temperature_2m", "relative_humidity_2m", "wind_speed_10m", "wind_direction_10m"]:
         if len(weather[key]) < 72:
-            weather[key] = weather[key] + [weather[key][-1]] * (72 - len(weather[key]))
+            weather[key] += [weather[key][-1]] * (72 - len(weather[key]))
 
-    # Get live predictions for all cities
     if predictor.last_predictions is None:
         raise RuntimeError("Predictions not initialized")
 
     current_preds = predictor.last_predictions
     current_map = {p["city"]: p for p in current_preds}
 
-    # Get city static data
+    # Get static city data
     city_data = pipeline.cities_df[pipeline.cities_df["city"] == city].iloc[0]
 
     prev_pm25 = base_pm25
+
+    # Safe defaults for other cities
+    DEFAULT_TEMP = 25.0
+    DEFAULT_HUM = 70.0
+    DEFAULT_WS = 5.0
+    DEFAULT_WD = 90.0
+    DEFAULT_POP = 1000
 
     for t in range(72):
         temp = weather["temperature_2m"][t]
@@ -299,16 +305,16 @@ def build_72h_forecast(
 
         for _, row in pipeline.cities_df.iterrows():
             live = current_map.get(row["city"])
-        
+
             # ---------- Selected city ----------
             if row["city"] == city:
                 if live:
                     fire = live.get("avg_fire_confidence", 0)
                     upwind = live.get("upwind_fire_count", 0)
-                    pop = live.get("population_density", 1000)
+                    pop = live.get("population_density", DEFAULT_POP)
                 else:
-                    fire, upwind, pop = 0, 0, 1000
-        
+                    fire, upwind, pop = 0, 0, DEFAULT_POP
+
                 all_features.append([
                     temp,
                     humidity,
@@ -319,33 +325,34 @@ def build_72h_forecast(
                     pop,
                     pm25_to_aqi(prev_pm25)
                 ])
-        
+
             # ---------- Other cities ----------
             else:
                 if live:
                     fire = live.get("avg_fire_confidence", 0)
                     upwind = live.get("upwind_fire_count", 0)
-                    pop = live.get("population_density", 1000)
+                    pop = live.get("population_density", DEFAULT_POP)
                     aqi = pm25_to_aqi(live["predicted_pm25"])
-                    temp2 = live["temperature"]
-                    hum2 = live["humidity"]
-                    ws2 = live["wind_speed"]
-                    wd2 = live["wind_direction"]
                 else:
-                    fire, upwind, pop = 0, 0, 1000
+                    fire, upwind, pop = 0, 0, DEFAULT_POP
                     aqi = 50
-                    temp2, hum2, ws2, wd2 = 25, 70, 5, 90
-        
+
+                # Use safe defaults for weather
+                temp2 = DEFAULT_TEMP
+                hum2 = DEFAULT_HUM
+                ws2 = DEFAULT_WS
+                wd2 = DEFAULT_WD
+
                 all_features.append([
-                    temp2, hum2, ws2, wd2,
-                    fire, upwind, pop,
+                    temp2,
+                    hum2,
+                    ws2,
+                    wd2,
+                    fire,
+                    upwind,
+                    pop,
                     aqi
                 ])
-
-
-
-
-
 
         X = torch.tensor(all_features, dtype=torch.float32)
         X = (X - pipeline.feature_mean) / pipeline.feature_std
@@ -355,10 +362,8 @@ def build_72h_forecast(
             pred, uncertainty = model(X, pipeline.edge_index)
 
         city_idx = pipeline.city_to_idx[city]
-        pm25 = float(pred[city_idx].cpu().numpy())
+        pm25 = max(1.0, float(pred[city_idx].cpu().numpy()))
         unc = float(uncertainty[city_idx].cpu().numpy())
-
-        pm25 = max(1.0, pm25)
         aqi = pm25_to_aqi(pm25)
 
         forecast.append({
@@ -376,6 +381,7 @@ def build_72h_forecast(
         prev_pm25 = pm25
 
     return forecast
+
 
 
 # -------------------- Prediction Engine --------------------
