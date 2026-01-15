@@ -182,7 +182,11 @@ class DataPipeline:
         response = self.supabase.table("gnn_training_data").select("*").execute()
         if not hasattr(response, "data") or response.data is None:
             raise ValueError("Supabase fetch failed")
-        df = pd.DataFrame(response.data).drop_duplicates(subset=['city']).reset_index(drop=True)
+        raw = pd.DataFrame(response.data)
+        if isinstance(raw.iloc[0]["city"], dict):
+            raw["city"] = raw["city"].apply(lambda x: x.get("city") if isinstance(x, dict) else x)
+
+        df = raw.drop_duplicates(subset=["city"]).reset_index(drop=True)
         if df.empty:
             raise ValueError("No data found in gnn_training_data")
         self.cities_df = df
