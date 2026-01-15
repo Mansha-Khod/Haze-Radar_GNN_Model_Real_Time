@@ -524,53 +524,41 @@ async def get_city_prediction(city_name: str):
 
 @app.get("/api/forecast/{city}", response_model=List[ForecastHourResponse])
 async def forecast_city(city: str):
-    """
-    Get 72-hour forecast using GNN with future weather data.
-    Returns array of hourly predictions for frontend slider.
-    """
-
-    
     city = unquote(city)
-
-    
     city_match = pipeline.cities_df[
         pipeline.cities_df["city"].str.lower() == city.lower()
     ]
-
     if city_match.empty:
         raise HTTPException(status_code=404, detail=f"City '{city}' not found")
 
     city_data = city_match.iloc[0]
     lat, lon = city_data["latitude"], city_data["longitude"]
     weather = get_future_weather(lat, lon)
+
     if predictor.last_predictions is None:
         raise HTTPException(503, "Predictions not ready yet")
-    current_preds = predictor.last_predictions
 
-    base_pm25 = None
+    base_pm25 = next(
+        (p["predicted_pm25"] for p in predictor.last_predictions
+         if p["city"].lower() == city.lower()), 40.0
+    )
 
-    for p in current_preds:
-        if p["city"].lower() == city.lower():
-            base_pm25 = p["predicted_pm25"]
-            break
-
-    if base_pm25 is None:
-        logger.warning(f"Using default PM2.5 for {city}")
-        base_pm25 = 40.0
-
-    
+    # Full 72-hour forecast internally
     forecast_data = build_72h_forecast(
-    predictor.model,
-    pipeline,
-    city_data["city"],
-    weather,
-    base_pm25,
-    device,
-    predictor
-)
+        predictor.model,
+        pipeline,
+        city_data["city"],
+        weather,
+        base_pm25,
+        device,
+        predictor
+    )
 
+    # Slider-ready 12h intervals
+    slider_data = [f for i, f in enumerate(forecast_data) if i % 12 == 0]
 
-    return forecast_data
+    return slider_data
+
 
 
 @app.post("/api/update")
