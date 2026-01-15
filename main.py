@@ -33,7 +33,7 @@ class Config:
     GRAPH_CACHE = "city_graph_cache.json"
     NORMALIZATION_STATS = "normalization_stats.json"
     PORT = int(os.getenv("PORT", 8000))
-    UPDATE_INTERVAL = 10800  # 3 hours = 10800 seconds
+    UPDATE_INTERVAL = 21600    # 6 hours 
     FEATURE_COLS = [
         'temperature', 'humidity', 'wind_speed', 'wind_direction',
         'avg_fire_confidence', 'upwind_fire_count', 'population_density',
