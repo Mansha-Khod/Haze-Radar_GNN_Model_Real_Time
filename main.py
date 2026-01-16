@@ -40,19 +40,28 @@ class Config:
 config = Config()
 
 def pm25_to_aqi(pm25: float) -> float:
+    """Convert PM2.5 to AQI using EPA breakpoints"""
     pm25 = max(0, pm25)
-    if pm25 <= 12.0:
-        return ((50 - 0) / (12.0 - 0.0)) * (pm25 - 0.0) + 0
-    elif pm25 <= 35.4:
-        return ((100 - 51) / (35.4 - 12.1)) * (pm25 - 12.1) + 51
-    elif pm25 <= 55.4:
-        return ((150 - 101) / (55.4 - 35.5)) * (pm25 - 35.5) + 101
-    elif pm25 <= 150.4:
-        return ((200 - 151) / (150.4 - 55.5)) * (pm25 - 55.5) + 151
-    elif pm25 <= 250.4:
-        return ((300 - 201) / (250.4 - 150.5)) * (pm25 - 150.5) + 201
-    else:
-        return ((500 - 301) / (500.4 - 250.5)) * (pm25 - 250.5) + 301
+    
+    # EPA PM2.5 AQI breakpoints (Concentration Low, Concentration High, AQI Low, AQI High)
+    breakpoints = [
+        (0.0, 12.0, 0, 50),
+        (12.1, 35.4, 51, 100),
+        (35.5, 55.4, 101, 150),
+        (55.5, 150.4, 151, 200),
+        (150.5, 250.4, 201, 300),
+        (250.5, 350.4, 301, 400),
+        (350.5, 500.4, 401, 500)
+    ]
+    
+    for c_low, c_high, i_low, i_high in breakpoints:
+        if c_low <= pm25 <= c_high:
+            # Linear interpolation formula
+            aqi = ((i_high - i_low) / (c_high - c_low)) * (pm25 - c_low) + i_low
+            return round(aqi, 1)
+    
+    # If PM2.5 > 500.4, use hazardous formula
+    return 500.0
 
 def pm25_to_category(pm25: float) -> str:
     pm25 = max(0, pm25)
@@ -431,7 +440,6 @@ class PredictionEngine:
                 r["aqi"],
                 r["aqi_category"],
             )
-        
         return results
 
 app = FastAPI(title="HazeRadar API", version="2.0.0")
