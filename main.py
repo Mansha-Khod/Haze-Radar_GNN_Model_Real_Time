@@ -1,6 +1,5 @@
 """
 HazeRadar Real-Time API Backend (Railway Deployment)
----------------------------------------------------
 """
 from urllib.parse import unquote
 import os
@@ -20,11 +19,9 @@ import logging
 from apscheduler.schedulers.background import BackgroundScheduler
 from supabase import create_client
 
-# -------------------- Logging --------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("HazeRadarAPI")
 
-# -------------------- Config --------------------
 class Config:
     SUPABASE_URL = os.getenv("SUPABASE_URL", "")
     SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
@@ -33,7 +30,7 @@ class Config:
     GRAPH_CACHE = "city_graph_cache.json"
     NORMALIZATION_STATS = "normalization_stats.json"
     PORT = int(os.getenv("PORT", 8000))
-    UPDATE_INTERVAL = 21600    # 6 hours 
+    UPDATE_INTERVAL = 21600
     FEATURE_COLS = [
         'temperature', 'humidity', 'wind_speed', 'wind_direction',
         'avg_fire_confidence', 'upwind_fire_count', 'population_density',
@@ -42,9 +39,7 @@ class Config:
 
 config = Config()
 
-# -------------------- Helper Functions --------------------
 def pm25_to_aqi(pm25: float) -> float:
-    """Convert PM2.5 to AQI using EPA formula"""
     if pm25 <= 12.0:
         return ((50 - 0) / (12.0 - 0.0)) * (pm25 - 0.0) + 0
     elif pm25 <= 35.4:
@@ -59,7 +54,6 @@ def pm25_to_aqi(pm25: float) -> float:
         return ((500 - 301) / (500.4 - 250.5)) * (pm25 - 250.5) + 301
 
 def pm25_to_category(pm25: float) -> str:
-    """Convert PM2.5 to AQI category"""
     if pm25 <= 12:
         return "Good"
     elif pm25 <= 35.4:
@@ -74,7 +68,6 @@ def pm25_to_category(pm25: float) -> str:
         return "Hazardous"
 
 def get_future_weather(lat: float, lon: float) -> Dict:
-    """Fetch 72-hour weather forecast from Open-Meteo"""
     url = (
         f"https://api.open-meteo.com/v1/forecast?"
         f"latitude={lat}&longitude={lon}"
@@ -100,7 +93,6 @@ def get_future_weather(lat: float, lon: float) -> Dict:
             "wind_direction_10m": [90.0] * 72
         }
 
-# -------------------- GNN Model --------------------
 class RealtimeHazeGNN(torch.nn.Module):
     def __init__(self, in_feats, hidden=128, out_feats=1, num_heads=4, dropout=0.2):
         super().__init__()
@@ -133,7 +125,6 @@ class RealtimeHazeGNN(torch.nn.Module):
         uncertainty = self.uncertainty_head(h)
         return pred, uncertainty
 
-# -------------------- Data Pipeline --------------------
 class DataPipeline:
     def __init__(self, config: Config):
         self.config = config
@@ -221,7 +212,7 @@ class DataPipeline:
             edges = [[i, i] for i in range(len(self.cities_df))]
         return edges
 
-    def prepare_realtime_features(self) -> Tuple[torch.Tensor, torch.Tensor]:
+    def prepare_realtime_features(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         weather_resp = self.supabase.table("gnn_training_data").select(
             "city, temperature, humidity, wind_speed, wind_direction, avg_fire_confidence, upwind_fire_count, population_density, current_aqi"
         ).order("timestamp", desc=True).limit(len(self.city_to_idx)).execute()
@@ -237,24 +228,28 @@ class DataPipeline:
             df[col] = pd.to_numeric(df[col], errors='coerce')
     
         features = []
+        raw_features = []
         for city in self.cities_df['city']:
             row = df[df["city"] == city]
             if len(row) == 0:
-                features.append([25, 70, 5, 90, 0, 0, 1000, 50])  
+                features.append([25, 70, 5, 90, 0, 0, 1000, 50])
+                raw_features.append([25, 70, 5, 90, 0, 0, 1000, 50])
                 continue
     
             row = row.iloc[0]
-            features.append([
+            feature_vector = [
                 row.temperature, row.humidity, row.wind_speed, row.wind_direction,
                 row.avg_fire_confidence, row.upwind_fire_count,
                 row.population_density, row.current_aqi
-            ])
+            ]
+            features.append(feature_vector)
+            raw_features.append(feature_vector)
     
+        X_raw = torch.tensor(raw_features, dtype=torch.float32)
         X = torch.tensor(features, dtype=torch.float32)
         X = (X - self.feature_mean) / self.feature_std
-        return X, self.edge_index
+        return X, self.edge_index, X_raw
 
-# -------------------- 72-Hour Forecast Builder --------------------
 def build_72h_forecast(
     model,
     pipeline: DataPipeline,
@@ -267,12 +262,10 @@ def build_72h_forecast(
     """
     Build 72-hour forecast using full-city GNN.
     Selected city evolves using future weather.
-    Other cities use safe default values.
+    Other cities use last-known values from predictions.
     """
-
     forecast = []
 
-    # Pad weather if less than 72 hours
     for key in ["temperature_2m", "relative_humidity_2m", "wind_speed_10m", "wind_direction_10m"]:
         if len(weather[key]) < 72:
             weather[key] += [weather[key][-1]] * (72 - len(weather[key]))
@@ -283,12 +276,10 @@ def build_72h_forecast(
     current_preds = predictor.last_predictions
     current_map = {p["city"]: p for p in current_preds}
 
-    # Get static city data
     city_data = pipeline.cities_df[pipeline.cities_df["city"] == city].iloc[0]
 
     prev_pm25 = base_pm25
 
-    # Safe defaults for other cities
     DEFAULT_TEMP = 25.0
     DEFAULT_HUM = 70.0
     DEFAULT_WS = 5.0
@@ -306,7 +297,6 @@ def build_72h_forecast(
         for _, row in pipeline.cities_df.iterrows():
             live = current_map.get(row["city"])
 
-            # ---------- Selected city ----------
             if row["city"] == city:
                 if live:
                     fire = live.get("avg_fire_confidence", 0)
@@ -326,22 +316,25 @@ def build_72h_forecast(
                     pm25_to_aqi(prev_pm25)
                 ])
 
-            # ---------- Other cities ----------
             else:
                 if live:
                     fire = live.get("avg_fire_confidence", 0)
                     upwind = live.get("upwind_fire_count", 0)
                     pop = live.get("population_density", DEFAULT_POP)
-                    aqi = pm25_to_aqi(live["predicted_pm25"])
+                    neighbor_pm25 = live["predicted_pm25"]
+                    neighbor_pm25 = 0.98 * neighbor_pm25 + 0.02 * prev_pm25
+                    aqi = pm25_to_aqi(neighbor_pm25)
+                    temp2 = live.get("temperature", DEFAULT_TEMP)
+                    hum2 = live.get("humidity", DEFAULT_HUM)
+                    ws2 = live.get("wind_speed", DEFAULT_WS)
+                    wd2 = live.get("wind_direction", DEFAULT_WD)
                 else:
                     fire, upwind, pop = 0, 0, DEFAULT_POP
                     aqi = 50
-
-                # Use safe defaults for weather
-                temp2 = DEFAULT_TEMP
-                hum2 = DEFAULT_HUM
-                ws2 = DEFAULT_WS
-                wd2 = DEFAULT_WD
+                    temp2 = DEFAULT_TEMP
+                    hum2 = DEFAULT_HUM
+                    ws2 = DEFAULT_WS
+                    wd2 = DEFAULT_WD
 
                 all_features.append([
                     temp2,
@@ -362,7 +355,10 @@ def build_72h_forecast(
             pred, uncertainty = model(X, pipeline.edge_index)
 
         city_idx = pipeline.city_to_idx[city]
-        pm25 = max(1.0, float(pred[city_idx].cpu().numpy()))
+
+        raw_pm25 = float(pred[city_idx].cpu().numpy())
+        pm25 = 0.7 * prev_pm25 + 0.3 * raw_pm25
+        pm25 = max(0.1, pm25)
         unc = float(uncertainty[city_idx].cpu().numpy())
         aqi = pm25_to_aqi(pm25)
 
@@ -382,9 +378,6 @@ def build_72h_forecast(
 
     return forecast
 
-
-
-# -------------------- Prediction Engine --------------------
 class PredictionEngine:
     def __init__(self, model, pipeline: DataPipeline, device: torch.device):
         self.model = model
@@ -395,7 +388,7 @@ class PredictionEngine:
         self.last_update = None
 
     def predict_current(self) -> List[Dict]:
-        X, edge_index = self.pipeline.prepare_realtime_features()
+        X, edge_index, X_raw = self.pipeline.prepare_realtime_features()
         X = X.to(self.device)
 
         with torch.no_grad():
@@ -411,7 +404,14 @@ class PredictionEngine:
                 'city': city,
                 'latitude': float(city_data['latitude']),
                 'longitude': float(city_data['longitude']),
-                'predicted_pm25': max(1, pm25),
+                'temperature': float(X_raw[idx][0]),
+                'humidity': float(X_raw[idx][1]),
+                'wind_speed': float(X_raw[idx][2]),
+                'wind_direction': float(X_raw[idx][3]),
+                'avg_fire_confidence': float(X_raw[idx][4]),
+                'upwind_fire_count': float(X_raw[idx][5]),
+                'population_density': float(X_raw[idx][6]),
+                'predicted_pm25': max(0.1, pm25),
                 'uncertainty': unc,
                 'aqi': pm25_to_aqi(pm25),
                 'aqi_category': pm25_to_category(pm25),
@@ -422,9 +422,6 @@ class PredictionEngine:
         self.last_update = datetime.now()
         return results
 
-
-
-# -------------------- FastAPI Setup --------------------
 app = FastAPI(title="HazeRadar API", version="2.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
                    allow_methods=["*"], allow_headers=["*"])
@@ -448,7 +445,7 @@ def update_predictions():
             lat, lon = row["latitude"], row["longitude"]
 
             weather = get_future_weather(lat, lon)
-            base_pm25 = next(p["predicted_pm25"] for p in preds if p["city"] == city)
+            base_pm25 = next((p["predicted_pm25"] for p in preds if p["city"] == city), 40.0)
 
             full = build_72h_forecast(
                 predictor.model,
@@ -469,8 +466,6 @@ def update_predictions():
     except Exception as e:
         logger.error(f"Prediction update failed: {e}")
 
-
-# -------------------- API Models --------------------
 class PredictionResponse(BaseModel):
     city: str
     latitude: float
@@ -499,14 +494,12 @@ class HealthResponse(BaseModel):
     cities_count: int
     version: str
 
-# -------------------- Endpoints --------------------
 @app.on_event("startup")
 async def startup_event():
     global pipeline, predictor
     pipeline = DataPipeline(config)
     pipeline.initialize()
     
-    # Move edge_index to device once
     pipeline.edge_index = pipeline.edge_index.to(device)
     
     model = RealtimeHazeGNN(in_feats=len(config.FEATURE_COLS)).to(device)
@@ -537,7 +530,6 @@ async def get_current_predictions():
 
 @app.get("/api/predictions/city/{city_name}", response_model=PredictionResponse)
 async def get_city_prediction(city_name: str):
-    """Get current prediction for a specific city"""
     if predictor.last_predictions is None:
         raise HTTPException(503, "Predictions not ready yet")
     preds = predictor.last_predictions
@@ -546,8 +538,6 @@ async def get_city_prediction(city_name: str):
         if p['city'].lower() == city_name.lower():
             return p
     raise HTTPException(status_code=404, detail=f"City '{city_name}' not found")
-
-
 
 @app.get("/api/forecast/{city}", response_model=List[ForecastHourResponse])
 async def forecast_city(city: str):
@@ -558,13 +548,9 @@ async def forecast_city(city: str):
     if city_match.empty:
         raise HTTPException(status_code=404, detail=f"City '{city}' not found")
 
-    city_data = city_match.iloc[0]
-    
-
     if predictor.last_predictions is None:
         raise HTTPException(503, "Predictions not ready yet")
 
-    # Full 72-hour forecast internally
     city_key = city.lower()
     if city_key not in forecast_cache:
         raise HTTPException(503, "Forecast not ready yet")
@@ -573,18 +559,13 @@ async def forecast_city(city: str):
     slider_data = [f for i, f in enumerate(forecast_data) if i % 12 == 0]
     return slider_data
 
-
-
-
 @app.post("/api/update")
 async def manual_update(background_tasks: BackgroundTasks):
-    """Manually trigger prediction update"""
     background_tasks.add_task(update_predictions)
     return {"status": "Update triggered"}
 
 @app.get("/api/stats")
 async def stats():
-    """Get API statistics"""
     return {
         "cities_count": len(pipeline.city_to_idx),
         "last_update": predictor.last_update.isoformat() if predictor.last_update else None,
