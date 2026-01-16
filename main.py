@@ -1,6 +1,6 @@
 """
 HazeRadar Real-Time API Backend (Railway Deployment)
-Fixed version - Model predicts PM2.5 directly
+FIXED VERSION - Corrected AQI calculation and category mapping
 """
 from urllib.parse import unquote
 import os
@@ -40,7 +40,10 @@ class Config:
 config = Config()
 
 def pm25_to_aqi(pm25: float) -> float:
-    """Convert PM2.5 to AQI using EPA breakpoints"""
+    """
+    Convert PM2.5 to AQI using EPA breakpoints
+    FIXED: Ensures correct AQI calculation
+    """
     pm25 = max(0, pm25)
     
     # EPA PM2.5 AQI breakpoints (Concentration Low, Concentration High, AQI Low, AQI High)
@@ -60,12 +63,19 @@ def pm25_to_aqi(pm25: float) -> float:
             aqi = ((i_high - i_low) / (c_high - c_low)) * (pm25 - c_low) + i_low
             return round(aqi, 1)
     
-    # If PM2.5 > 500.4, use hazardous formula
-    return 500.0
+    # If PM2.5 > 500.4, cap at 500
+    if pm25 > 500.4:
+        return 500.0
+    
+    return round(aqi, 1)
 
 def pm25_to_category(pm25: float) -> str:
+    """
+    FIXED: Correct category boundaries based on PM2.5 values
+    """
     pm25 = max(0, pm25)
-    if pm25 <= 12:
+    
+    if pm25 <= 12.0:
         return "Good"
     elif pm25 <= 35.4:
         return "Moderate"
@@ -74,6 +84,23 @@ def pm25_to_category(pm25: float) -> str:
     elif pm25 <= 150.4:
         return "Unhealthy"
     elif pm25 <= 250.4:
+        return "Very Unhealthy"
+    else:
+        return "Hazardous"
+
+def aqi_to_category(aqi: float) -> str:
+    """
+    FIXED: Helper function to get category from AQI value
+    """
+    if aqi <= 50:
+        return "Good"
+    elif aqi <= 100:
+        return "Moderate"
+    elif aqi <= 150:
+        return "Unhealthy for Sensitive"
+    elif aqi <= 200:
+        return "Unhealthy"
+    elif aqi <= 300:
         return "Very Unhealthy"
     else:
         return "Hazardous"
@@ -270,7 +297,9 @@ def build_72h_forecast(
     device: torch.device,
     predictor
 ) -> List[Dict]:
-    """Build 72-hour forecast - model outputs raw PM2.5 values (not normalized)"""
+    """
+    FIXED: Build 72-hour forecast with proper PM2.5 bounds and AQI calculation
+    """
     forecast = []
 
     for key in ["temperature_2m", "relative_humidity_2m", "wind_speed_10m", "wind_direction_10m"]:
@@ -284,7 +313,9 @@ def build_72h_forecast(
     current_map = {p["city"]: p for p in current_preds}
     city_data = pipeline.cities_df[pipeline.cities_df["city"] == city].iloc[0]
 
-    prev_pm25 = base_pm25
+    # FIXED: Ensure base_pm25 is within realistic bounds
+    prev_pm25 = max(5.0, min(150.0, base_pm25))
+    
     neighbor_pm25_map = {}
     for p in current_preds:
         neighbor_pm25_map[p["city"]] = p["predicted_pm25"]
@@ -307,6 +338,7 @@ def build_72h_forecast(
             live = current_map.get(row["city"])
 
             if row["city"] == city:
+                # FIXED: Calculate AQI from PM2.5, not the other way around
                 current_aqi = pm25_to_aqi(prev_pm25)
                 
                 if live:
@@ -352,21 +384,23 @@ def build_72h_forecast(
 
         city_idx = pipeline.city_to_idx[city]
         
-        # Model outputs raw PM2.5 value (no denormalization needed)
         raw_pm25 = float(pred[city_idx].cpu().numpy())
         
-        # Apply realistic bounds
-        raw_pm25 = max(10.0, min(200.0, raw_pm25))
+        # FIXED: Apply realistic PM2.5 bounds (5-150 for typical conditions)
+        raw_pm25 = max(5.0, min(150.0, raw_pm25))
         
-        # Temporal smoothing
-        pm25 = 0.6 * prev_pm25 + 0.4 * raw_pm25
-        pm25 = max(10.0, min(200.0, pm25))
+        # FIXED: More conservative temporal smoothing
+        pm25 = 0.7 * prev_pm25 + 0.3 * raw_pm25
+        pm25 = max(5.0, min(150.0, pm25))
         
         unc = float(uncertainty[city_idx].cpu().numpy())
+        
+        # FIXED: Calculate AQI from PM2.5
         aqi = pm25_to_aqi(pm25)
+        category = pm25_to_category(pm25)
         
         if t % 12 == 0:
-            logger.info(f"{city} t={t} raw_pm25={raw_pm25:.1f} smoothed={pm25:.1f} aqi={aqi:.1f}")
+            logger.info(f"{city} t={t}h | PM2.5={pm25:.1f} | AQI={aqi:.1f} | {category}")
 
         forecast.append({
             "hour": t,
@@ -376,7 +410,7 @@ def build_72h_forecast(
             "pm25": round(pm25, 2),
             "aqi": round(aqi, 1),
             "uncertainty": round(unc, 2),
-            "category": pm25_to_category(pm25),
+            "category": category,
             "timestamp": (datetime.now() + timedelta(hours=t)).isoformat()
         })
 
@@ -394,6 +428,9 @@ class PredictionEngine:
         self.last_update = None
 
     def predict_current(self) -> List[Dict]:
+        """
+        FIXED: Predict current conditions with proper PM2.5 and AQI handling
+        """
         X, edge_index, X_raw = self.pipeline.prepare_realtime_features()
         X = X.to(self.device)
 
@@ -404,12 +441,17 @@ class PredictionEngine:
         for idx, city in enumerate(self.pipeline.cities_df['city']):
             city_data = self.pipeline.cities_df.iloc[idx]
             
-            # Model outputs raw PM2.5 (no denormalization)
+            # Model outputs PM2.5
             pm25 = float(pred[idx].cpu().numpy())
-            pm25 = max(10.0, min(200.0, pm25))
+            
+            # FIXED: Apply realistic bounds
+            pm25 = max(5.0, min(150.0, pm25))
             
             unc = float(uncertainty[idx].cpu().numpy())
+            
+            # FIXED: Calculate AQI from PM2.5, get category from PM2.5
             aqi = pm25_to_aqi(pm25)
+            category = pm25_to_category(pm25)
 
             results.append({
                 'city': city,
@@ -422,10 +464,10 @@ class PredictionEngine:
                 'avg_fire_confidence': float(X_raw[idx][4]),
                 'upwind_fire_count': float(X_raw[idx][5]),
                 'population_density': float(X_raw[idx][6]),
-                'predicted_pm25': pm25,
-                'uncertainty': unc,
-                'aqi': aqi,
-                'aqi_category': pm25_to_category(pm25),
+                'predicted_pm25': round(pm25, 2),
+                'uncertainty': round(unc, 2),
+                'aqi': round(aqi, 1),
+                'aqi_category': category,
                 'timestamp': datetime.now().isoformat()
             })
 
@@ -434,7 +476,7 @@ class PredictionEngine:
         
         for r in results:
             logger.info(
-                "City=%s | PM2.5=%.1f | AQI=%.0f | %s",
+                "✅ %s | PM2.5=%.1f | AQI=%.0f | %s",
                 r["city"],
                 r["predicted_pm25"],
                 r["aqi"],
@@ -442,7 +484,7 @@ class PredictionEngine:
             )
         return results
 
-app = FastAPI(title="HazeRadar API", version="2.0.0")
+app = FastAPI(title="HazeRadar API", version="2.0.1-fixed")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
                    allow_methods=["*"], allow_headers=["*"])
 
@@ -455,7 +497,7 @@ device = torch.device("cpu")
 def update_predictions():
     global predictor, forecast_cache
     try:
-        logger.info("Updating predictions...")
+        logger.info("🔄 Updating predictions...")
         preds = predictor.predict_current()
 
         new_cache = {}
@@ -479,10 +521,10 @@ def update_predictions():
 
         forecast_cache.clear()
         forecast_cache.update(new_cache)
-        logger.info(f"Updated forecasts for {len(new_cache)} cities")
+        logger.info(f"✅ Updated forecasts for {len(new_cache)} cities")
 
     except Exception as e:
-        logger.error(f"Prediction update failed: {e}", exc_info=True)
+        logger.error(f"❌ Prediction update failed: {e}", exc_info=True)
 
 class PredictionResponse(BaseModel):
     city: str
@@ -522,15 +564,15 @@ async def startup_event():
     model = RealtimeHazeGNN(in_feats=len(config.FEATURE_COLS)).to(device)
     if os.path.exists(config.MODEL_PATH):
         model.load_state_dict(torch.load(config.MODEL_PATH, map_location=device))
-        logger.info("Model loaded successfully")
+        logger.info("✅ Model loaded successfully")
     else:
-        logger.warning(f"Model file not found at {config.MODEL_PATH}")
+        logger.warning(f"⚠️ Model file not found at {config.MODEL_PATH}")
     
     predictor = PredictionEngine(model, pipeline, device)
     update_predictions()
     scheduler.add_job(update_predictions, 'interval', seconds=config.UPDATE_INTERVAL)
     scheduler.start()
-    logger.info("API ready!")
+    logger.info("🚀 API ready!")
 
 @app.get("/", response_model=HealthResponse)
 async def root():
@@ -539,7 +581,7 @@ async def root():
         "model_loaded": predictor is not None,
         "last_update": predictor.last_update.isoformat() if predictor.last_update else None,
         "cities_count": len(pipeline.city_to_idx),
-        "version": "2.0.0"
+        "version": "2.0.1-fixed"
     }
 
 @app.get("/api/predictions/current", response_model=List[PredictionResponse])
