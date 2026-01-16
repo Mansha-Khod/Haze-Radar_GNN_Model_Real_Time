@@ -1,6 +1,6 @@
 """
 HazeRadar Real-Time API Backend (Railway Deployment)
-Competition-ready version with proper denormalization
+Fixed version - Model predicts PM2.5 directly
 """
 from urllib.parse import unquote
 import os
@@ -27,9 +27,8 @@ class Config:
     SUPABASE_URL = os.getenv("SUPABASE_URL", "")
     SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
     FIRMS_API_KEY = os.getenv("FIRMS_API_KEY", "")
-    MODEL_PATH = os.getenv("MODEL_PATH", "real_time_haze_infer.pt")
+    MODEL_PATH = os.getenv("MODEL_PATH", "realtime_haze_gnn_infer.pt")
     GRAPH_CACHE = "city_graph_cache.json"
-    NORMALIZATION_STATS = "normalization_stats.json"
     PORT = int(os.getenv("PORT", 8000))
     UPDATE_INTERVAL = 21600
     FEATURE_COLS = [
@@ -137,8 +136,6 @@ class DataPipeline:
         self.cities_df = None
         self.feature_mean = None
         self.feature_std = None
-        self.target_mean = 58.68
-        self.target_std = 48.18
 
     def initialize(self):
         logger.info("Initializing data pipeline...")
@@ -157,11 +154,6 @@ class DataPipeline:
                     self.edge_index = torch.tensor(cache['edges'], dtype=torch.long).t().contiguous()
                     self.feature_mean = torch.tensor(cache['feature_mean'], dtype=torch.float32)
                     self.feature_std = torch.tensor(cache['feature_std'], dtype=torch.float32)
-                    
-                    if 'target_mean' in cache and 'target_std' in cache:
-                        self.target_mean = cache['target_mean']
-                        self.target_std = cache['target_std']
-                    
                     logger.info("Loaded graph cache")
             except Exception as e:
                 logger.warning(f"Failed to load cache: {e}")
@@ -172,9 +164,7 @@ class DataPipeline:
             'city_to_idx': self.city_to_idx,
             'edges': self.edge_index.t().tolist(),
             'feature_mean': self.feature_mean.tolist(),
-            'feature_std': self.feature_std.tolist(),
-            'target_mean': float(self.target_mean),
-            'target_std': float(self.target_std)
+            'feature_std': self.feature_std.tolist()
         }
         with open(self.config.GRAPH_CACHE, 'w') as f:
             json.dump(cache, f)
@@ -186,7 +176,7 @@ class DataPipeline:
         if not hasattr(response, "data") or response.data is None:
             raise ValueError("Supabase fetch failed")
         raw = pd.DataFrame(response.data)
-        if isinstance(raw.iloc[0]["city"], dict):
+        if len(raw) > 0 and isinstance(raw.iloc[0]["city"], dict):
             raw["city"] = raw["city"].apply(lambda x: x.get("city") if isinstance(x, dict) else x)
 
         df = raw.drop_duplicates(subset=["city"]).reset_index(drop=True)
@@ -261,10 +251,6 @@ class DataPipeline:
         X = torch.tensor(features, dtype=torch.float32)
         X = (X - self.feature_mean) / self.feature_std
         return X, self.edge_index, X_raw
-    
-    def denormalize_prediction(self, normalized_value: float) -> float:
-        """Convert normalized model output back to actual PM2.5 value"""
-        return normalized_value * self.target_std + self.target_mean
 
 def build_72h_forecast(
     model,
@@ -275,9 +261,7 @@ def build_72h_forecast(
     device: torch.device,
     predictor
 ) -> List[Dict]:
-    """
-    Build 72-hour forecast using full-city GNN with proper denormalization
-    """
+    """Build 72-hour forecast - model outputs raw PM2.5 values (not normalized)"""
     forecast = []
 
     for key in ["temperature_2m", "relative_humidity_2m", "wind_speed_10m", "wind_direction_10m"]:
@@ -289,11 +273,9 @@ def build_72h_forecast(
 
     current_preds = predictor.last_predictions
     current_map = {p["city"]: p for p in current_preds}
-
     city_data = pipeline.cities_df[pipeline.cities_df["city"] == city].iloc[0]
 
     prev_pm25 = base_pm25
-    
     neighbor_pm25_map = {}
     for p in current_preds:
         neighbor_pm25_map[p["city"]] = p["predicted_pm25"]
@@ -316,6 +298,8 @@ def build_72h_forecast(
             live = current_map.get(row["city"])
 
             if row["city"] == city:
+                current_aqi = pm25_to_aqi(prev_pm25)
+                
                 if live:
                     fire = live.get("avg_fire_confidence", 0)
                     upwind = live.get("upwind_fire_count", 0)
@@ -323,16 +307,7 @@ def build_72h_forecast(
                 else:
                     fire, upwind, pop = 0, 0, DEFAULT_POP
 
-                all_features.append([
-                    temp,
-                    humidity,
-                    wind_speed,
-                    wind_dir,
-                    fire,
-                    upwind,
-                    pop,
-                    pm25_to_aqi(prev_pm25)
-                ])
+                all_features.append([temp, humidity, wind_speed, wind_dir, fire, upwind, pop, current_aqi])
 
             else:
                 if live:
@@ -344,29 +319,20 @@ def build_72h_forecast(
                     neighbor_pm25 = 0.98 * neighbor_pm25 + 0.02 * prev_pm25
                     neighbor_pm25_map[row["city"]] = neighbor_pm25
                     
-                    aqi = pm25_to_aqi(neighbor_pm25)
+                    neighbor_aqi = pm25_to_aqi(neighbor_pm25)
                     temp2 = live.get("temperature", DEFAULT_TEMP)
                     hum2 = live.get("humidity", DEFAULT_HUM)
                     ws2 = live.get("wind_speed", DEFAULT_WS)
                     wd2 = live.get("wind_direction", DEFAULT_WD)
                 else:
                     fire, upwind, pop = 0, 0, DEFAULT_POP
-                    aqi = 50
+                    neighbor_aqi = 50
                     temp2 = DEFAULT_TEMP
                     hum2 = DEFAULT_HUM
                     ws2 = DEFAULT_WS
                     wd2 = DEFAULT_WD
 
-                all_features.append([
-                    temp2,
-                    hum2,
-                    ws2,
-                    wd2,
-                    fire,
-                    upwind,
-                    pop,
-                    aqi
-                ])
+                all_features.append([temp2, hum2, ws2, wd2, fire, upwind, pop, neighbor_aqi])
 
         X = torch.tensor(all_features, dtype=torch.float32)
         X = (X - pipeline.feature_mean) / pipeline.feature_std
@@ -376,22 +342,22 @@ def build_72h_forecast(
             pred, uncertainty = model(X, pipeline.edge_index)
 
         city_idx = pipeline.city_to_idx[city]
-
-        normalized_pm25 = float(pred[city_idx].cpu().numpy())
-        raw_pm25 = pipeline.denormalize_prediction(normalized_pm25)
         
-        # Clamp raw prediction to realistic range
-        raw_pm25 = max(5.0, min(300.0, raw_pm25))
+        # Model outputs raw PM2.5 value (no denormalization needed)
+        raw_pm25 = float(pred[city_idx].cpu().numpy())
         
-        # Temporal smoothing with capped result
-        pm25 = 0.7 * prev_pm25 + 0.3 * raw_pm25
-        pm25 = max(5.0, min(300.0, pm25))
+        # Apply realistic bounds
+        raw_pm25 = max(10.0, min(200.0, raw_pm25))
+        
+        # Temporal smoothing
+        pm25 = 0.6 * prev_pm25 + 0.4 * raw_pm25
+        pm25 = max(10.0, min(200.0, pm25))
         
         unc = float(uncertainty[city_idx].cpu().numpy())
         aqi = pm25_to_aqi(pm25)
         
         if t % 12 == 0:
-            logger.info(f"{city} t={t} normalized={normalized_pm25:.3f} denorm={raw_pm25:.1f} final={pm25:.1f}")
+            logger.info(f"{city} t={t} raw_pm25={raw_pm25:.1f} smoothed={pm25:.1f} aqi={aqi:.1f}")
 
         forecast.append({
             "hour": t,
@@ -429,13 +395,12 @@ class PredictionEngine:
         for idx, city in enumerate(self.pipeline.cities_df['city']):
             city_data = self.pipeline.cities_df.iloc[idx]
             
-            normalized_pm25 = float(pred[idx].cpu().numpy())
-            pm25 = self.pipeline.denormalize_prediction(normalized_pm25)
-            
-            # Clamp to realistic range (5-300 µg/m³)
-            pm25 = max(5.0, min(300.0, pm25))
+            # Model outputs raw PM2.5 (no denormalization)
+            pm25 = float(pred[idx].cpu().numpy())
+            pm25 = max(10.0, min(200.0, pm25))
             
             unc = float(uncertainty[idx].cpu().numpy())
+            aqi = pm25_to_aqi(pm25)
 
             results.append({
                 'city': city,
@@ -450,7 +415,7 @@ class PredictionEngine:
                 'population_density': float(X_raw[idx][6]),
                 'predicted_pm25': pm25,
                 'uncertainty': unc,
-                'aqi': pm25_to_aqi(pm25),
+                'aqi': aqi,
                 'aqi_category': pm25_to_category(pm25),
                 'timestamp': datetime.now().isoformat()
             })
@@ -458,7 +423,14 @@ class PredictionEngine:
         self.last_predictions = results
         self.last_update = datetime.now()
         
-        logger.info(f"Generated {len(results)} predictions - Sample: {results[0]['city']} PM2.5={results[0]['predicted_pm25']:.1f} AQI={results[0]['aqi']:.1f}")
+        for r in results:
+            logger.info(
+                "City=%s | PM2.5=%.1f | AQI=%.0f | %s",
+                r["city"],
+                r["predicted_pm25"],
+                r["aqi"],
+                r["aqi_category"],
+            )
         
         return results
 
@@ -479,7 +451,6 @@ def update_predictions():
         preds = predictor.predict_current()
 
         new_cache = {}
-
         for _, row in pipeline.cities_df.iterrows():
             city = row["city"]
             lat, lon = row["latitude"], row["longitude"]
@@ -496,12 +467,11 @@ def update_predictions():
                 device,
                 predictor
             )
-
             new_cache[city.lower()] = full
 
         forecast_cache.clear()
         forecast_cache.update(new_cache)
-        logger.info(f"Updated predictions and forecasts for {len(new_cache)} cities")
+        logger.info(f"Updated forecasts for {len(new_cache)} cities")
 
     except Exception as e:
         logger.error(f"Prediction update failed: {e}", exc_info=True)
@@ -539,7 +509,6 @@ async def startup_event():
     global pipeline, predictor
     pipeline = DataPipeline(config)
     pipeline.initialize()
-    
     pipeline.edge_index = pipeline.edge_index.to(device)
     
     model = RealtimeHazeGNN(in_feats=len(config.FEATURE_COLS)).to(device)
@@ -585,9 +554,7 @@ async def get_city_prediction(city_name: str):
 @app.get("/api/forecast/{city}", response_model=List[ForecastHourResponse])
 async def forecast_city(city: str):
     city = unquote(city)
-    city_match = pipeline.cities_df[
-        pipeline.cities_df["city"].str.lower() == city.lower()
-    ]
+    city_match = pipeline.cities_df[pipeline.cities_df["city"].str.lower() == city.lower()]
     if city_match.empty:
         raise HTTPException(status_code=404, detail=f"City '{city}' not found")
 
@@ -599,7 +566,6 @@ async def forecast_city(city: str):
         raise HTTPException(503, "Forecast not ready yet")
     
     forecast_data = forecast_cache[city_key]
-    
     slider_indices = [0, 12, 24, 36, 48, 60]
     slider_data = []
     
