@@ -321,7 +321,7 @@ def build_72h_forecast(
                 if live:
                     fire = live.get("avg_fire_confidence", 0)
                     upwind = live.get("upwind_fire_count", 0)
-                    pop = live.get("population_density", DEFAULT_POP
+                    pop = live.get("population_density", DEFAULT_POP)
 
                 else:
                     fire, upwind, pop = 0, 0, DEFAULT_POP
