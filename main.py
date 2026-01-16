@@ -27,7 +27,7 @@ class Config:
     SUPABASE_URL = os.getenv("SUPABASE_URL", "")
     SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
     FIRMS_API_KEY = os.getenv("FIRMS_API_KEY", "")
-    MODEL_PATH = os.getenv("MODEL_PATH", "real_time_haze_infer.pt")
+    MODEL_PATH = os.getenv("MODEL_PATH", "realtime_haze_gnn_infer.pt")
     GRAPH_CACHE = "city_graph_cache.json"
     NORMALIZATION_STATS = "normalization_stats.json"
     PORT = int(os.getenv("PORT", 8000))
@@ -329,8 +329,7 @@ def build_72h_forecast(
                     wind_dir,
                     fire,
                     upwind,
-                    pop,
-                    pm25_to_aqi(prev_pm25)
+                    pop
                 ])
 
             else:
@@ -363,8 +362,7 @@ def build_72h_forecast(
                     wd2,
                     fire,
                     upwind,
-                    pop,
-                    aqi
+                    pop
                 ])
 
         X = torch.tensor(all_features, dtype=torch.float32)
