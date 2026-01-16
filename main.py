@@ -321,9 +321,7 @@ def build_72h_forecast(
                     fire = live.get("avg_fire_confidence", 0)
                     upwind = live.get("upwind_fire_count", 0)
                     pop = live.get("population_density", DEFAULT_POP)
-                    neighbor_pm25 = live["predicted_pm25"]
-                    neighbor_pm25 = 0.98 * neighbor_pm25 + 0.02 * prev_pm25
-                    aqi = pm25_to_aqi(neighbor_pm25)
+                    aqi = pm25_to_aqi(live["predicted_pm25"])
                     temp2 = live.get("temperature", DEFAULT_TEMP)
                     hum2 = live.get("humidity", DEFAULT_HUM)
                     ws2 = live.get("wind_speed", DEFAULT_WS)
@@ -411,7 +409,7 @@ class PredictionEngine:
                 'avg_fire_confidence': float(X_raw[idx][4]),
                 'upwind_fire_count': float(X_raw[idx][5]),
                 'population_density': float(X_raw[idx][6]),
-                'predicted_pm25': max(0.1, pm25),
+                'predicted_pm25': max(0.1, float(pm25)),
                 'uncertainty': unc,
                 'aqi': pm25_to_aqi(pm25),
                 'aqi_category': pm25_to_category(pm25),
@@ -556,7 +554,16 @@ async def forecast_city(city: str):
         raise HTTPException(503, "Forecast not ready yet")
     
     forecast_data = forecast_cache[city_key]
-    slider_data = [f for i, f in enumerate(forecast_data) if i % 12 == 0]
+    
+    slider_indices = [0, 12, 24, 36, 48, 60]
+    slider_data = []
+    
+    for idx in slider_indices:
+        if idx < len(forecast_data):
+            point = dict(forecast_data[idx])
+            point['hour'] = idx
+            slider_data.append(point)
+    
     return slider_data
 
 @app.post("/api/update")
