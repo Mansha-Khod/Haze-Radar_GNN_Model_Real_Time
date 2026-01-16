@@ -262,7 +262,7 @@ def build_72h_forecast(
     """
     Build 72-hour forecast using full-city GNN.
     Selected city evolves using future weather.
-    Other cities use last-known values from predictions.
+    Other cities evolve based on main city pollution.
     """
     forecast = []
 
@@ -279,6 +279,10 @@ def build_72h_forecast(
     city_data = pipeline.cities_df[pipeline.cities_df["city"] == city].iloc[0]
 
     prev_pm25 = base_pm25
+    
+    neighbor_pm25_map = {}
+    for p in current_preds:
+        neighbor_pm25_map[p["city"]] = p["predicted_pm25"]
 
     DEFAULT_TEMP = 25.0
     DEFAULT_HUM = 70.0
@@ -321,7 +325,12 @@ def build_72h_forecast(
                     fire = live.get("avg_fire_confidence", 0)
                     upwind = live.get("upwind_fire_count", 0)
                     pop = live.get("population_density", DEFAULT_POP)
-                    aqi = pm25_to_aqi(live["predicted_pm25"])
+                    
+                    neighbor_pm25 = neighbor_pm25_map.get(row["city"], live["predicted_pm25"])
+                    neighbor_pm25 = 0.98 * neighbor_pm25 + 0.02 * prev_pm25
+                    neighbor_pm25_map[row["city"]] = neighbor_pm25
+                    
+                    aqi = pm25_to_aqi(neighbor_pm25)
                     temp2 = live.get("temperature", DEFAULT_TEMP)
                     hum2 = live.get("humidity", DEFAULT_HUM)
                     ws2 = live.get("wind_speed", DEFAULT_WS)
@@ -356,19 +365,21 @@ def build_72h_forecast(
 
         raw_pm25 = float(pred[city_idx].cpu().numpy())
         pm25 = 0.7 * prev_pm25 + 0.3 * raw_pm25
-        pm25 = max(0.1, pm25)
         unc = float(uncertainty[city_idx].cpu().numpy())
         aqi = pm25_to_aqi(pm25)
+        
+        if t % 12 == 0:
+            logger.info(f"{city} t={t} raw={raw_pm25:.3f} prev={prev_pm25:.3f} smoothed={pm25:.3f}")
 
         forecast.append({
             "hour": t,
             "temperature": round(temp, 1),
             "humidity": round(humidity, 1),
             "wind_speed": round(wind_speed, 1),
-            "pm25": round(pm25, 2),
-            "aqi": round(aqi, 1),
+            "pm25": round(max(0.1, pm25), 2),
+            "aqi": round(max(0, aqi), 1),
             "uncertainty": round(unc, 2),
-            "category": pm25_to_category(pm25),
+            "category": pm25_to_category(max(0.1, pm25)),
             "timestamp": (datetime.now() + timedelta(hours=t)).isoformat()
         })
 
@@ -409,7 +420,7 @@ class PredictionEngine:
                 'avg_fire_confidence': float(X_raw[idx][4]),
                 'upwind_fire_count': float(X_raw[idx][5]),
                 'population_density': float(X_raw[idx][6]),
-                'predicted_pm25': max(0.1, float(pm25)),
+                'predicted_pm25': float(pm25),
                 'uncertainty': unc,
                 'aqi': pm25_to_aqi(pm25),
                 'aqi_category': pm25_to_category(pm25),
