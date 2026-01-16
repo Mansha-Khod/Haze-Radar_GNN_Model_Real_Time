@@ -364,7 +364,14 @@ def build_72h_forecast(
         city_idx = pipeline.city_to_idx[city]
 
         raw_pm25 = float(pred[city_idx].cpu().numpy())
+        
+        # Handle negative predictions from GNN
+        if raw_pm25 < 0:
+            raw_pm25 = abs(raw_pm25)
+        
         pm25 = 0.7 * prev_pm25 + 0.3 * raw_pm25
+        pm25 = max(1.0, pm25)
+        
         unc = float(uncertainty[city_idx].cpu().numpy())
         aqi = pm25_to_aqi(pm25)
         
@@ -376,10 +383,10 @@ def build_72h_forecast(
             "temperature": round(temp, 1),
             "humidity": round(humidity, 1),
             "wind_speed": round(wind_speed, 1),
-            "pm25": round(max(0.1, pm25), 2),
-            "aqi": round(max(0, aqi), 1),
+            "pm25": round(pm25, 2),
+            "aqi": round(aqi, 1),
             "uncertainty": round(unc, 2),
-            "category": pm25_to_category(max(0.1, pm25)),
+            "category": pm25_to_category(pm25),
             "timestamp": (datetime.now() + timedelta(hours=t)).isoformat()
         })
 
@@ -406,7 +413,11 @@ class PredictionEngine:
         results = []
         for idx, city in enumerate(self.pipeline.cities_df['city']):
             city_data = self.pipeline.cities_df.iloc[idx]
-            pm25 = float(pred[idx].cpu().numpy())
+            raw_pm25 = float(pred[idx].cpu().numpy())
+            
+            # Apply softplus or ReLU to ensure positive values
+            pm25 = max(1.0, raw_pm25) if raw_pm25 > 0 else max(1.0, abs(raw_pm25))
+            
             unc = float(uncertainty[idx].cpu().numpy())
 
             results.append({
@@ -420,7 +431,7 @@ class PredictionEngine:
                 'avg_fire_confidence': float(X_raw[idx][4]),
                 'upwind_fire_count': float(X_raw[idx][5]),
                 'population_density': float(X_raw[idx][6]),
-                'predicted_pm25': float(pm25),
+                'predicted_pm25': pm25,
                 'uncertainty': unc,
                 'aqi': pm25_to_aqi(pm25),
                 'aqi_category': pm25_to_category(pm25),
