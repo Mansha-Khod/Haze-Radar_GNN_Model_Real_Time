@@ -27,7 +27,7 @@ class Config:
     SUPABASE_URL = os.getenv("SUPABASE_URL", "")
     SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
     FIRMS_API_KEY = os.getenv("FIRMS_API_KEY", "")
-    MODEL_PATH = os.getenv("MODEL_PATH", "realtime_haze_gnn_infer.pt")
+    MODEL_PATH = os.getenv("MODEL_PATH", "real_time_haze_infer.pt")
     GRAPH_CACHE = "city_graph_cache.json"
     NORMALIZATION_STATS = "normalization_stats.json"
     PORT = int(os.getenv("PORT", 8000))
@@ -35,7 +35,7 @@ class Config:
     FEATURE_COLS = [
         'temperature', 'humidity', 'wind_speed', 'wind_direction',
         'avg_fire_confidence', 'upwind_fire_count', 'population_density',
-    'current_aqi'
+        'current_aqi'
     ]
 
 config = Config()
@@ -244,16 +244,15 @@ class DataPipeline:
         for city in self.cities_df['city']:
             row = df[df["city"] == city]
             if len(row) == 0:
-                features.append([25, 70, 5, 90, 0, 0, 1000,50])
-                raw_features.append([25, 70, 5, 90, 0, 0, 1000,50])
+                features.append([25, 70, 5, 90, 0, 0, 1000, 50])
+                raw_features.append([25, 70, 5, 90, 0, 0, 1000, 50])
                 continue
     
             row = row.iloc[0]
             feature_vector = [
                 row.temperature, row.humidity, row.wind_speed, row.wind_direction,
                 row.avg_fire_confidence, row.upwind_fire_count,
-                row.population_density,
-    row.current_aqi
+                row.population_density, row.current_aqi
             ]
             features.append(feature_vector)
             raw_features.append(feature_vector)
@@ -317,12 +316,10 @@ def build_72h_forecast(
             live = current_map.get(row["city"])
 
             if row["city"] == city:
-                aqi = pm25_to_aqi(prev_pm25)
                 if live:
                     fire = live.get("avg_fire_confidence", 0)
                     upwind = live.get("upwind_fire_count", 0)
                     pop = live.get("population_density", DEFAULT_POP)
-
                 else:
                     fire, upwind, pop = 0, 0, DEFAULT_POP
 
@@ -333,7 +330,8 @@ def build_72h_forecast(
                     wind_dir,
                     fire,
                     upwind,
-                    pop,aqi 
+                    pop,
+                    pm25_to_aqi(prev_pm25)
                 ])
 
             else:
@@ -366,7 +364,8 @@ def build_72h_forecast(
                     wd2,
                     fire,
                     upwind,
-                    pop, aqi 
+                    pop,
+                    aqi
                 ])
 
         X = torch.tensor(all_features, dtype=torch.float32)
@@ -380,10 +379,13 @@ def build_72h_forecast(
 
         normalized_pm25 = float(pred[city_idx].cpu().numpy())
         raw_pm25 = pipeline.denormalize_prediction(normalized_pm25)
-        raw_pm25 = max(5.0, raw_pm25)
         
+        # Clamp raw prediction to realistic range
+        raw_pm25 = max(5.0, min(300.0, raw_pm25))
+        
+        # Temporal smoothing with capped result
         pm25 = 0.7 * prev_pm25 + 0.3 * raw_pm25
-        pm25 = max(5.0, pm25)
+        pm25 = max(5.0, min(300.0, pm25))
         
         unc = float(uncertainty[city_idx].cpu().numpy())
         aqi = pm25_to_aqi(pm25)
@@ -429,7 +431,9 @@ class PredictionEngine:
             
             normalized_pm25 = float(pred[idx].cpu().numpy())
             pm25 = self.pipeline.denormalize_prediction(normalized_pm25)
-            pm25 = max(5.0, pm25)
+            
+            # Clamp to realistic range (5-300 µg/m³)
+            pm25 = max(5.0, min(300.0, pm25))
             
             unc = float(uncertainty[idx].cpu().numpy())
 
@@ -454,7 +458,7 @@ class PredictionEngine:
         self.last_predictions = results
         self.last_update = datetime.now()
         
-        logger.info(f"Generated {len(results)} predictions - Sample: {results[0]['city']} PM2.5={results[0]['predicted_pm25']:.1f}")
+        logger.info(f"Generated {len(results)} predictions - Sample: {results[0]['city']} PM2.5={results[0]['predicted_pm25']:.1f} AQI={results[0]['aqi']:.1f}")
         
         return results
 
