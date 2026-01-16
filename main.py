@@ -1,5 +1,6 @@
 """
 HazeRadar Real-Time API Backend (Railway Deployment)
+Competition-ready version with proper denormalization
 """
 from urllib.parse import unquote
 import os
@@ -40,6 +41,7 @@ class Config:
 config = Config()
 
 def pm25_to_aqi(pm25: float) -> float:
+    pm25 = max(0, pm25)
     if pm25 <= 12.0:
         return ((50 - 0) / (12.0 - 0.0)) * (pm25 - 0.0) + 0
     elif pm25 <= 35.4:
@@ -54,6 +56,7 @@ def pm25_to_aqi(pm25: float) -> float:
         return ((500 - 301) / (500.4 - 250.5)) * (pm25 - 250.5) + 301
 
 def pm25_to_category(pm25: float) -> str:
+    pm25 = max(0, pm25)
     if pm25 <= 12:
         return "Good"
     elif pm25 <= 35.4:
@@ -134,6 +137,8 @@ class DataPipeline:
         self.cities_df = None
         self.feature_mean = None
         self.feature_std = None
+        self.target_mean = 58.68
+        self.target_std = 48.18
 
     def initialize(self):
         logger.info("Initializing data pipeline...")
@@ -152,6 +157,11 @@ class DataPipeline:
                     self.edge_index = torch.tensor(cache['edges'], dtype=torch.long).t().contiguous()
                     self.feature_mean = torch.tensor(cache['feature_mean'], dtype=torch.float32)
                     self.feature_std = torch.tensor(cache['feature_std'], dtype=torch.float32)
+                    
+                    if 'target_mean' in cache and 'target_std' in cache:
+                        self.target_mean = cache['target_mean']
+                        self.target_std = cache['target_std']
+                    
                     logger.info("Loaded graph cache")
             except Exception as e:
                 logger.warning(f"Failed to load cache: {e}")
@@ -162,7 +172,9 @@ class DataPipeline:
             'city_to_idx': self.city_to_idx,
             'edges': self.edge_index.t().tolist(),
             'feature_mean': self.feature_mean.tolist(),
-            'feature_std': self.feature_std.tolist()
+            'feature_std': self.feature_std.tolist(),
+            'target_mean': float(self.target_mean),
+            'target_std': float(self.target_std)
         }
         with open(self.config.GRAPH_CACHE, 'w') as f:
             json.dump(cache, f)
@@ -249,6 +261,10 @@ class DataPipeline:
         X = torch.tensor(features, dtype=torch.float32)
         X = (X - self.feature_mean) / self.feature_std
         return X, self.edge_index, X_raw
+    
+    def denormalize_prediction(self, normalized_value: float) -> float:
+        """Convert normalized model output back to actual PM2.5 value"""
+        return normalized_value * self.target_std + self.target_mean
 
 def build_72h_forecast(
     model,
@@ -260,9 +276,7 @@ def build_72h_forecast(
     predictor
 ) -> List[Dict]:
     """
-    Build 72-hour forecast using full-city GNN.
-    Selected city evolves using future weather.
-    Other cities evolve based on main city pollution.
+    Build 72-hour forecast using full-city GNN with proper denormalization
     """
     forecast = []
 
@@ -363,20 +377,18 @@ def build_72h_forecast(
 
         city_idx = pipeline.city_to_idx[city]
 
-        raw_pm25 = float(pred[city_idx].cpu().numpy())
-        
-        # Handle negative predictions from GNN
-        if raw_pm25 < 0:
-            raw_pm25 = abs(raw_pm25)
+        normalized_pm25 = float(pred[city_idx].cpu().numpy())
+        raw_pm25 = pipeline.denormalize_prediction(normalized_pm25)
+        raw_pm25 = max(5.0, raw_pm25)
         
         pm25 = 0.7 * prev_pm25 + 0.3 * raw_pm25
-        pm25 = max(1.0, pm25)
+        pm25 = max(5.0, pm25)
         
         unc = float(uncertainty[city_idx].cpu().numpy())
         aqi = pm25_to_aqi(pm25)
         
         if t % 12 == 0:
-            logger.info(f"{city} t={t} raw={raw_pm25:.3f} prev={prev_pm25:.3f} smoothed={pm25:.3f}")
+            logger.info(f"{city} t={t} normalized={normalized_pm25:.3f} denorm={raw_pm25:.1f} final={pm25:.1f}")
 
         forecast.append({
             "hour": t,
@@ -413,10 +425,10 @@ class PredictionEngine:
         results = []
         for idx, city in enumerate(self.pipeline.cities_df['city']):
             city_data = self.pipeline.cities_df.iloc[idx]
-            raw_pm25 = float(pred[idx].cpu().numpy())
             
-            # Apply softplus or ReLU to ensure positive values
-            pm25 = max(1.0, raw_pm25) if raw_pm25 > 0 else max(1.0, abs(raw_pm25))
+            normalized_pm25 = float(pred[idx].cpu().numpy())
+            pm25 = self.pipeline.denormalize_prediction(normalized_pm25)
+            pm25 = max(5.0, pm25)
             
             unc = float(uncertainty[idx].cpu().numpy())
 
@@ -440,6 +452,9 @@ class PredictionEngine:
 
         self.last_predictions = results
         self.last_update = datetime.now()
+        
+        logger.info(f"Generated {len(results)} predictions - Sample: {results[0]['city']} PM2.5={results[0]['predicted_pm25']:.1f}")
+        
         return results
 
 app = FastAPI(title="HazeRadar API", version="2.0.0")
@@ -481,10 +496,10 @@ def update_predictions():
 
         forecast_cache.clear()
         forecast_cache.update(new_cache)
-        logger.info("Updated predictions and forecasts")
+        logger.info(f"Updated predictions and forecasts for {len(new_cache)} cities")
 
     except Exception as e:
-        logger.error(f"Prediction update failed: {e}")
+        logger.error(f"Prediction update failed: {e}", exc_info=True)
 
 class PredictionResponse(BaseModel):
     city: str
@@ -526,6 +541,9 @@ async def startup_event():
     if os.path.exists(config.MODEL_PATH):
         model.load_state_dict(torch.load(config.MODEL_PATH, map_location=device))
         logger.info("Model loaded successfully")
+    else:
+        logger.warning(f"Model file not found at {config.MODEL_PATH}")
+    
     predictor = PredictionEngine(model, pipeline, device)
     update_predictions()
     scheduler.add_job(update_predictions, 'interval', seconds=config.UPDATE_INTERVAL)
