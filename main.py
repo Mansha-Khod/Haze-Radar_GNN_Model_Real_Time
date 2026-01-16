@@ -34,7 +34,8 @@ class Config:
     UPDATE_INTERVAL = 21600
     FEATURE_COLS = [
         'temperature', 'humidity', 'wind_speed', 'wind_direction',
-        'avg_fire_confidence', 'upwind_fire_count', 'population_density'
+        'avg_fire_confidence', 'upwind_fire_count', 'population_density',
+    'current_aqi'
     ]
 
 config = Config()
@@ -243,15 +244,16 @@ class DataPipeline:
         for city in self.cities_df['city']:
             row = df[df["city"] == city]
             if len(row) == 0:
-                features.append([25, 70, 5, 90, 0, 0, 1000])
-                raw_features.append([25, 70, 5, 90, 0, 0, 1000])
+                features.append([25, 70, 5, 90, 0, 0, 1000,50])
+                raw_features.append([25, 70, 5, 90, 0, 0, 1000,50])
                 continue
     
             row = row.iloc[0]
             feature_vector = [
                 row.temperature, row.humidity, row.wind_speed, row.wind_direction,
                 row.avg_fire_confidence, row.upwind_fire_count,
-                row.population_density
+                row.population_density,
+    row.current_aqi
             ]
             features.append(feature_vector)
             raw_features.append(feature_vector)
@@ -315,10 +317,12 @@ def build_72h_forecast(
             live = current_map.get(row["city"])
 
             if row["city"] == city:
+                aqi = pm25_to_aqi(prev_pm25)
                 if live:
                     fire = live.get("avg_fire_confidence", 0)
                     upwind = live.get("upwind_fire_count", 0)
-                    pop = live.get("population_density", DEFAULT_POP)
+                    pop = live.get("population_density", DEFAULT_POP
+
                 else:
                     fire, upwind, pop = 0, 0, DEFAULT_POP
 
@@ -329,7 +333,7 @@ def build_72h_forecast(
                     wind_dir,
                     fire,
                     upwind,
-                    pop
+                    pop,aqi 
                 ])
 
             else:
@@ -362,7 +366,7 @@ def build_72h_forecast(
                     wd2,
                     fire,
                     upwind,
-                    pop
+                    pop, aqi 
                 ])
 
         X = torch.tensor(all_features, dtype=torch.float32)
