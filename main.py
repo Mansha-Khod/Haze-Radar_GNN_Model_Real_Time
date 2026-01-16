@@ -34,8 +34,7 @@ class Config:
     UPDATE_INTERVAL = 21600
     FEATURE_COLS = [
         'temperature', 'humidity', 'wind_speed', 'wind_direction',
-        'avg_fire_confidence', 'upwind_fire_count', 'population_density',
-        'current_aqi'
+        'avg_fire_confidence', 'upwind_fire_count', 'population_density'
     ]
 
 config = Config()
@@ -244,15 +243,15 @@ class DataPipeline:
         for city in self.cities_df['city']:
             row = df[df["city"] == city]
             if len(row) == 0:
-                features.append([25, 70, 5, 90, 0, 0, 1000, 50])
-                raw_features.append([25, 70, 5, 90, 0, 0, 1000, 50])
+                features.append([25, 70, 5, 90, 0, 0, 1000])
+                raw_features.append([25, 70, 5, 90, 0, 0, 1000])
                 continue
     
             row = row.iloc[0]
             feature_vector = [
                 row.temperature, row.humidity, row.wind_speed, row.wind_direction,
                 row.avg_fire_confidence, row.upwind_fire_count,
-                row.population_density, row.current_aqi
+                row.population_density
             ]
             features.append(feature_vector)
             raw_features.append(feature_vector)
