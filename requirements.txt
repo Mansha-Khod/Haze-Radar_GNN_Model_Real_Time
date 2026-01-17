@@ -1,16 +1,16 @@
-torch==2.2.2
+# requirements.txt
+# CPU-only PyTorch (much smaller than GPU version)
+--index-url https://download.pytorch.org/whl/cpu
+torch==2.2.2+cpu
+--find-links https://data.pyg.org/whl/torch-2.2.2+cpu.html
 torch-geometric==2.5.3
 
-numpy
-pandas
-scikit-learn
+numpy==1.24.3
+pandas==2.0.3
 
-fastapi
-uvicorn
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
 
 supabase==2.4.5
-postgrest
-realtime
-storage3
-python-dotenv
-
+python-dotenv==1.0.0
