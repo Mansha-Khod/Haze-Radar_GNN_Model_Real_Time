@@ -262,14 +262,13 @@ class ModelManager:
                 # Store all features
                 city_data[city] = {col: float(row.get(col, 0)) for col in FEATURE_COLS}
                 
-                # CRITICAL: Store target_pm25_24h separately
+                # Store target PM2.5
                 target = float(row.get("target_pm25_24h", 0))
                 city_data[city]["target_pm25"] = target
                 
-                # Debug log
-                logger.debug(f"  📥 Fetched {city}: target_pm25_24h={target:.2f}, timestamp={row.get('timestamp')}")
+                logger.debug(f"  Fetched {city}: target_pm25_24h={target:.2f}, timestamp={row.get('timestamp')}")
             
-            logger.info(f"✅ Fetched data for {len(city_data)} cities from Supabase")
+            logger.info(f"Fetched data for {len(city_data)} cities from Supabase")
             return city_data
             
         except Exception as e:
@@ -282,12 +281,12 @@ class ModelManager:
         Pre-calculates EVERYTHING and caches it
         """
         try:
-            logger.info("🔄 Starting full prediction update...")
+            logger.info("Starting full prediction update...")
             
             # 1. Fetch weather for ALL cities in parallel
             logger.info("Fetching weather forecasts...")
             self.weather_cache = await fetch_weather_forecast_batch()
-            logger.info(f"✅ Weather cached for {len(self.weather_cache)} cities")
+            logger.info(f"Weather cached for {len(self.weather_cache)} cities")
             
             # 2. Get current Supabase data
             city_data = self.fetch_current_data()
@@ -311,21 +310,19 @@ class ModelManager:
                 uncertainty_values = uncertainty.cpu().numpy().flatten()
             
             # 4. Build current predictions
-            logger.info("📊 Building current predictions...")
+            logger.info("Building current predictions...")
             current_results = []
             for i, city in enumerate(self.cities):
-                # CRITICAL FIX: Always use Supabase data when available
+                # Always use Supabase data when available
                 supabase_pm25 = None
                 if city in city_data:
                     supabase_pm25 = city_data[city].get("target_pm25", 0)
                 
                 # Decide which value to use
                 if supabase_pm25 and supabase_pm25 > 0:
-                    # Use Supabase (REAL DATA)
                     pm25 = supabase_pm25
                     source = "Supabase"
                 else:
-                    # Fallback to model
                     pm25 = float(pm25_values[i])
                     pm25 = max(5.0, min(pm25, 150.0))
                     source = "Model"
@@ -333,9 +330,12 @@ class ModelManager:
                 aqi = pm25_to_aqi(pm25)
                 status = aqi_to_category(aqi)
                 
-                # Get current weather (hour 0)
+                # Get current weather
                 weather_today = self.weather_cache.get(city, [{"temperature": 27.0}])
                 current_temp = weather_today[0]["temperature"] if weather_today else 27.0
+                
+                # Get coordinates
+                coords = CITY_COORDINATES.get(city, {})
                 
                 current_results.append({
                     "city": city,
@@ -344,15 +344,16 @@ class ModelManager:
                     "uncertainty": round(float(uncertainty_values[i]), 2),
                     "status": status,
                     "temperature": round(current_temp, 1),
+                    "latitude": coords.get("lat"),
+                    "longitude": coords.get("lon"),
                     "timestamp": datetime.now().isoformat()
                 })
                 
-                # Better logging
                 logger.info(f"  {city:15s}: PM2.5={pm25:6.2f} (source={source:8s}), AQI={aqi:5.1f}, Status={status}")
             
             self.current_predictions_cache = current_results
             
-            # 5. Build forecasts for each city (using simple drift, not re-running GNN)
+            # 5. Build forecasts for each city (using realistic time-based evolution)
             logger.info("Building forecasts...")
             for city in self.cities:
                 city_idx = self.city_to_idx[city]
@@ -363,6 +364,7 @@ class ModelManager:
                 base_features = city_data.get(city, {col: 0.0 for col in FEATURE_COLS})
                 
                 city_forecasts = []
+                prev_pm25 = base_pm25
                 
                 for target_hour in FORECAST_HOURS:
                     if target_hour >= len(weather_forecast):
@@ -370,18 +372,49 @@ class ModelManager:
                     else:
                         weather_at_hour = weather_forecast[target_hour]
                     
-                    # Simple time-based PM2.5 drift (no expensive GNN re-run)
                     if target_hour == 0:
                         pm25 = base_pm25
                     else:
-                        # Gradual decay/change based on time and wind
-                        hour_factor = target_hour / 60.0
-                        wind_factor = weather_at_hour.get("wind_speed", 3.5) / 10.0
-                        fire_decay = max(0, 1 - hour_factor)
+                        # Build feature vector for this time step
+                        temp = weather_at_hour.get("temperature", 27.0)
+                        humidity = weather_at_hour.get("humidity", 75.0)
+                        wind_speed = weather_at_hour.get("wind_speed", 3.5)
+                        wind_dir = base_features.get("wind_direction", 120.0)
                         
-                        # PM2.5 tends to decrease over time with wind dispersion
-                        pm25 = base_pm25 * (1 - 0.1 * hour_factor) * (1 - 0.05 * wind_factor)
-                        pm25 = max(5.0, pm25)  # Floor at 5
+                        # Fire activity decays over time
+                        hours_passed = target_hour
+                        fire_decay = max(0.3, 1 - (hours_passed / 72.0))
+                        fire_conf = base_features.get("avg_fire_confidence", 0.0) * fire_decay
+                        upwind_fires = base_features.get("upwind_fire_count", 0.0) * fire_decay
+                        pop_density = base_features.get("population_density", 1000.0)
+                        
+                        # Build feature array for ALL cities (need full graph context)
+                        all_city_features = []
+                        for c in self.cities:
+                            if c == city:
+                                # Target city uses future weather
+                                feat = [temp, humidity, wind_speed, wind_dir, fire_conf, upwind_fires, pop_density]
+                            else:
+                                # Other cities use base features
+                                base = city_data.get(c, {col: 0.0 for col in FEATURE_COLS})
+                                feat = [base.get(col, 0.0) for col in FEATURE_COLS]
+                            all_city_features.append(feat)
+                        
+                        # Run model prediction
+                        features = np.array(all_city_features, dtype=np.float32)
+                        features_norm = self.normalize_features(features)
+                        x = torch.tensor(features_norm, dtype=torch.float32).to(self.device)
+                        
+                        with torch.no_grad():
+                            pm25_pred, _ = self.model(x, self.edge_index)
+                            pm25_values = pm25_pred.cpu().numpy().flatten()
+                        
+                        # Get prediction for this city
+                        predicted_pm25 = float(pm25_values[city_idx])
+                        
+                        # Smooth transition from previous hour
+                        pm25 = 0.6 * prev_pm25 + 0.4 * predicted_pm25
+                        pm25 = max(5.0, min(pm25, 200.0))
                     
                     aqi = pm25_to_aqi(pm25)
                     category = aqi_to_category(aqi)
@@ -393,14 +426,16 @@ class ModelManager:
                         "aqi": round(aqi, 1),
                         "category": category,
                         "temperature": round(weather_at_hour.get("temperature", 27.0), 1),
-                        "uncertainty": round(pm25 * 0.1, 2),
+                        "uncertainty": round(pm25 * 0.15, 2),
                         "timestamp": (datetime.now() + timedelta(hours=target_hour)).isoformat()
                     })
+                    
+                    prev_pm25 = pm25
                 
                 self.forecast_cache[city] = city_forecasts
             
             self.last_update = datetime.now()
-            logger.info(f"✅ Full update complete! Cached {len(self.forecast_cache)} city forecasts")
+            logger.info(f"Full update complete! Cached {len(self.forecast_cache)} city forecasts")
             
         except Exception as e:
             logger.error(f"Update failed: {e}", exc_info=True)
@@ -414,6 +449,8 @@ class CurrentPrediction(BaseModel):
     status: str
     temperature: float
     timestamp: str
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
 
 
 class ForecastPoint(BaseModel):
@@ -462,7 +499,7 @@ async def startup_event():
         )
         scheduler.start()
         
-        logger.info("✅ Startup complete - API ready!")
+        logger.info("Startup complete - API ready!")
     except Exception as e:
         logger.error(f"Startup failed: {e}")
         raise
@@ -554,6 +591,41 @@ async def debug_supabase():
         "data": result,
         "timestamp": datetime.now().isoformat()
     }
+
+
+@app.get("/api/cities/markers")
+async def get_city_markers():
+    """Get city locations for map markers"""
+    if not model_manager.current_predictions_cache:
+        raise HTTPException(status_code=503, detail="Predictions not ready yet")
+    
+    markers = []
+    for pred in model_manager.current_predictions_cache:
+        if pred.get("latitude") and pred.get("longitude"):
+            # Determine marker color based on AQI
+            aqi = pred.get("aqi", 50)
+            if aqi <= 50:
+                color = "#10b981"  # Green
+            elif aqi <= 100:
+                color = "#f59e0b"  # Yellow
+            elif aqi <= 150:
+                color = "#f97316"  # Orange
+            elif aqi <= 200:
+                color = "#ef4444"  # Red
+            else:
+                color = "#7c3aed"  # Purple
+            
+            markers.append({
+                "city": pred["city"],
+                "lat": pred["latitude"],
+                "lng": pred["longitude"],
+                "pm25": pred["pm25"],
+                "aqi": pred["aqi"],
+                "status": pred["status"],
+                "color": color
+            })
+    
+    return markers
 
 
 if __name__ == "__main__":
