@@ -41,9 +41,9 @@ FORECAST_HOURS = [0, 12, 24, 36, 48, 60]
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
-MODEL_PATH = os.getenv("MODEL_PATH", "realtime_haze_gnn_infer.pt")
-NORM_STATS_PATH = os.getenv("NORM_STATS_PATH", "normalization_stats.json")
-GRAPH_PATH = os.getenv("GRAPH_PATH", "city_graph.json")
+MODEL_PATH = os.getenv("MODEL_PATH", "artifacts/realtime_haze_gnn_infer.pt")
+NORM_STATS_PATH = os.getenv("NORM_STATS_PATH", "artifacts/normalization_stats.json")
+GRAPH_PATH = os.getenv("GRAPH_PATH", "artifacts/city_graph.json")
 
 FORECAST_CACHE_TTL_HOURS = 12
 
