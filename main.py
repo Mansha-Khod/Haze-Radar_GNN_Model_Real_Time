@@ -1,52 +1,117 @@
+# main.py
 """
-HazeRadar Real-Time API Backend (Railway Deployment)
-FIXED VERSION - Corrected AQI calculation and category mapping
+Production FastAPI backend for spatiotemporal air quality forecasting
+Uses pre-trained GNN model for PM2.5 prediction and 72-hour forecasting
 """
-from urllib.parse import unquote
+
 import os
 import json
+import logging
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
+from collections import defaultdict
+
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GATv2Conv, LayerNorm
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
+from torch_geometric.nn import GATv2Conv
+from torch_geometric.data import Data
+import numpy as np
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Dict, Optional, Tuple
-from datetime import datetime, timedelta
-import pandas as pd
-import numpy as np
-import requests
-import logging
-from apscheduler.schedulers.background import BackgroundScheduler
 from supabase import create_client
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("HazeRadarAPI")
+logger = logging.getLogger(__name__)
 
-class Config:
-    SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-    SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
-    FIRMS_API_KEY = os.getenv("FIRMS_API_KEY", "")
-    MODEL_PATH = os.getenv("MODEL_PATH", "realtime_haze_gnn_infer.pt")
-    GRAPH_CACHE = "city_graph_cache.json"
-    PORT = int(os.getenv("PORT", 8000))
-    UPDATE_INTERVAL = 21600
-    FEATURE_COLS = [
-        'temperature', 'humidity', 'wind_speed', 'wind_direction',
-        'avg_fire_confidence', 'upwind_fire_count', 'population_density',
-        'current_aqi'
-    ]
 
-config = Config()
+FEATURE_COLS = [
+    "temperature",
+    "humidity",
+    "wind_speed",
+    "wind_direction",
+    "avg_fire_confidence",
+    "upwind_fire_count",
+    "population_density"
+]
+
+FORECAST_HOURS = [0, 12, 24, 36, 48, 60]
+
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+MODEL_PATH = os.getenv("MODEL_PATH", "artifacts/realtime_haze_gnn_infer.pt")
+NORM_STATS_PATH = os.getenv("NORM_STATS_PATH", "artifacts/normalization_stats.json")
+GRAPH_PATH = os.getenv("GRAPH_PATH", "artifacts/city_graph.json")
+
+FORECAST_CACHE_TTL_HOURS = 12
+
+
+class HazeForecastGNN(nn.Module):
+    """
+    Graph Attention Network for PM2.5 prediction
+    Architecture must match training configuration exactly
+    """
+    def __init__(self, in_features: int, hidden_dim: int = 128, 
+                 num_heads: int = 4, dropout: float = 0.2):
+        super().__init__()
+        
+        self.gat1 = GATv2Conv(
+            in_features, 
+            hidden_dim // num_heads, 
+            heads=num_heads, 
+            dropout=dropout
+        )
+        self.ln1 = nn.LayerNorm(hidden_dim)
+        
+        self.gat2 = GATv2Conv(
+            hidden_dim, 
+            hidden_dim // num_heads, 
+            heads=num_heads, 
+            dropout=dropout
+        )
+        self.ln2 = nn.LayerNorm(hidden_dim)
+        
+        self.prediction_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+        
+        self.uncertainty_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 4),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 4, 1),
+            nn.Softplus()
+        )
+        
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x, edge_index):
+        h = self.gat1(x, edge_index)
+        h = F.elu(self.ln1(h))
+        h = self.dropout(h)
+        
+        h2 = self.gat2(h, edge_index)
+        h2 = self.ln2(h2)
+        h = F.elu(h + h2)
+        
+        pm25_pred = self.prediction_head(h)
+        uncertainty = self.uncertainty_head(h)
+        
+        return pm25_pred, uncertainty
+
 
 def pm25_to_aqi(pm25: float) -> float:
     """
-    Convert PM2.5 to AQI using EPA breakpoints
-    FIXED: Ensures correct AQI calculation
+    Convert PM2.5 concentration to AQI using EPA breakpoints
     """
-    pm25 = max(0, pm25)
+    if pm25 is None or np.isnan(pm25):
+        return 50.0
     
-    # EPA PM2.5 AQI breakpoints (Concentration Low, Concentration High, AQI Low, AQI High)
+    pm25 = max(0, float(pm25))
+    
     breakpoints = [
         (0.0, 12.0, 0, 50),
         (12.1, 35.4, 51, 100),
@@ -59,38 +124,15 @@ def pm25_to_aqi(pm25: float) -> float:
     
     for c_low, c_high, i_low, i_high in breakpoints:
         if c_low <= pm25 <= c_high:
-            # Linear interpolation formula
             aqi = ((i_high - i_low) / (c_high - c_low)) * (pm25 - c_low) + i_low
             return round(aqi, 1)
     
-    # If PM2.5 > 500.4, cap at 500
-    if pm25 > 500.4:
-        return 500.0
-    
-    return round(aqi, 1)
+    return 500.0
 
-def pm25_to_category(pm25: float) -> str:
-    """
-    FIXED: Correct category boundaries based on PM2.5 values
-    """
-    pm25 = max(0, pm25)
-    
-    if pm25 <= 12.0:
-        return "Good"
-    elif pm25 <= 35.4:
-        return "Moderate"
-    elif pm25 <= 55.4:
-        return "Unhealthy for Sensitive"
-    elif pm25 <= 150.4:
-        return "Unhealthy"
-    elif pm25 <= 250.4:
-        return "Very Unhealthy"
-    else:
-        return "Hazardous"
 
 def aqi_to_category(aqi: float) -> str:
     """
-    FIXED: Helper function to get category from AQI value
+    Convert AQI value to categorical status
     """
     if aqi <= 50:
         return "Good"
@@ -105,542 +147,494 @@ def aqi_to_category(aqi: float) -> str:
     else:
         return "Hazardous"
 
-def get_future_weather(lat: float, lon: float) -> Dict:
-    url = (
-        f"https://api.open-meteo.com/v1/forecast?"
-        f"latitude={lat}&longitude={lon}"
-        f"&hourly=temperature_2m,relative_humidity_2m,wind_speed_10m,wind_direction_10m"
-        f"&forecast_days=3"
-    )
-    try:
-        resp = requests.get(url, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        return {
-            "temperature_2m": data["hourly"]["temperature_2m"][:72],
-            "relative_humidity_2m": data["hourly"]["relative_humidity_2m"][:72],
-            "wind_speed_10m": data["hourly"]["wind_speed_10m"][:72],
-            "wind_direction_10m": data["hourly"]["wind_direction_10m"][:72]
-        }
-    except Exception as e:
-        logger.warning(f"Weather fetch failed for lat={lat}, lon={lon}: {e}")
-        return {
-            "temperature_2m": [25.0] * 72,
-            "relative_humidity_2m": [70.0] * 72,
-            "wind_speed_10m": [5.0] * 72,
-            "wind_direction_10m": [90.0] * 72
-        }
 
-class RealtimeHazeGNN(torch.nn.Module):
-    def __init__(self, in_feats, hidden=128, out_feats=1, num_heads=4, dropout=0.2):
-        super().__init__()
-        self.gat1 = GATv2Conv(in_feats, hidden // num_heads, heads=num_heads, dropout=dropout)
-        self.ln1 = LayerNorm(hidden)
-        self.gat2 = GATv2Conv(hidden, hidden // num_heads, heads=num_heads, dropout=dropout)
-        self.ln2 = LayerNorm(hidden)
-        self.pred_head = torch.nn.Sequential(
-            torch.nn.Linear(hidden, hidden // 2),
-            torch.nn.ReLU(),
-            torch.nn.Dropout(dropout),
-            torch.nn.Linear(hidden // 2, out_feats)
-        )
-        self.uncertainty_head = torch.nn.Sequential(
-            torch.nn.Linear(hidden, hidden // 4),
-            torch.nn.ReLU(),
-            torch.nn.Linear(hidden // 4, out_feats),
-            torch.nn.Softplus()
-        )
-        self.dropout = torch.nn.Dropout(dropout)
-
-    def forward(self, x, edge_index):
-        h = self.gat1(x, edge_index)
-        h = F.elu(self.ln1(h))
-        h = self.dropout(h)
-        h2 = self.gat2(h, edge_index)
-        h2 = self.ln2(h2)
-        h = F.elu(h + h2)
-        pred = self.pred_head(h)
-        uncertainty = self.uncertainty_head(h)
-        return pred, uncertainty
-
-class DataPipeline:
-    def __init__(self, config: Config):
-        self.config = config
-        self.supabase = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
-        self.city_to_idx = {}
-        self.edge_index = None
-        self.cities_df = None
+class ModelManager:
+    """
+    Manages model loading, inference, and caching
+    """
+    def __init__(self):
+        self.model = None
+        self.device = torch.device("cpu")
         self.feature_mean = None
         self.feature_std = None
-
-    def initialize(self):
-        logger.info("Initializing data pipeline...")
-        self._load_cache()
-        if self.edge_index is None or len(self.city_to_idx) == 0:
-            self._build_from_database()
-            self._save_cache()
-
-    def _load_cache(self):
-        if os.path.exists(self.config.GRAPH_CACHE):
-            try:
-                with open(self.config.GRAPH_CACHE, 'r') as f:
-                    cache = json.load(f)
-                    self.cities_df = pd.DataFrame(cache['cities'])
-                    self.city_to_idx = cache['city_to_idx']
-                    self.edge_index = torch.tensor(cache['edges'], dtype=torch.long).t().contiguous()
-                    self.feature_mean = torch.tensor(cache['feature_mean'], dtype=torch.float32)
-                    self.feature_std = torch.tensor(cache['feature_std'], dtype=torch.float32)
-                    logger.info("Loaded graph cache")
-            except Exception as e:
-                logger.warning(f"Failed to load cache: {e}")
-
-    def _save_cache(self):
-        cache = {
-            'cities': self.cities_df.to_dict('records'),
-            'city_to_idx': self.city_to_idx,
-            'edges': self.edge_index.t().tolist(),
-            'feature_mean': self.feature_mean.tolist(),
-            'feature_std': self.feature_std.tolist()
-        }
-        with open(self.config.GRAPH_CACHE, 'w') as f:
-            json.dump(cache, f)
-        logger.info("Saved graph cache")
-
-    def _build_from_database(self):
-        logger.info("Building graph from Supabase...")
-        response = self.supabase.table("gnn_training_data").select("*").execute()
+        self.city_to_idx = None
+        self.edges = None
+        self.cities = None
+        self.edge_index = None
+        self.supabase = None
+        
+        self.forecast_cache = defaultdict(dict)
+        self.cache_timestamps = defaultdict(dict)
+        self.full_forecast_cache = {}
+        self.full_forecast_timestamps = {}
+    
+    def load_artifacts(self):
+        """
+        Load model weights, normalization stats, and graph structure
+        """
+        logger.info("Loading normalization statistics...")
+        with open(NORM_STATS_PATH, 'r') as f:
+            norm_stats = json.load(f)
+        
+        feature_cols = norm_stats.get('feature_cols', [])
+        if feature_cols != FEATURE_COLS:
+            raise ValueError(
+                f"Feature mismatch. Expected {FEATURE_COLS}, got {feature_cols}"
+            )
+        
+        self.feature_mean = np.array(norm_stats['feature_mean'], dtype=np.float32)
+        self.feature_std = np.array(norm_stats['feature_std'], dtype=np.float32)
+        
+        if len(self.feature_mean) != 7:
+            raise ValueError(f"Expected 7 features, got {len(self.feature_mean)}")
+        
+        logger.info("Loading graph structure...")
+        with open(GRAPH_PATH, 'r') as f:
+            graph_data = json.load(f)
+        
+        self.city_to_idx = graph_data['city_to_idx']
+        self.edges = graph_data['edges']
+        self.cities = sorted(self.city_to_idx.keys(), key=lambda c: self.city_to_idx[c])
+        
+        self.edge_index = torch.tensor(self.edges, dtype=torch.long).t().contiguous()
+        
+        logger.info(f"Graph loaded: {len(self.cities)} cities, {len(self.edges)} edges")
+        
+        logger.info("Loading model...")
+        self.model = HazeForecastGNN(in_features=7, hidden_dim=128, num_heads=4, dropout=0.2)
+        
+        state_dict = torch.load(MODEL_PATH, map_location=self.device)
+        self.model.load_state_dict(state_dict)
+        self.model.to(self.device)
+        self.model.eval()
+        
+        logger.info("Model loaded successfully")
+        logger.info(f"Model input dim: 7")
+        logger.info(f"Normalization vector length: {len(self.feature_mean)}")
+        
+        if SUPABASE_URL and SUPABASE_KEY:
+            self.supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+            logger.info("Supabase client initialized")
+        else:
+            logger.warning("Supabase credentials not found")
+    
+    def normalize_features(self, features: np.ndarray) -> np.ndarray:
+        """
+        Apply normalization using saved statistics
+        """
+        return (features - self.feature_mean) / self.feature_std
+    
+    def fetch_current_data(self) -> Dict[str, Dict]:
+        """
+        Fetch latest data per city from Supabase
+        """
+        if not self.supabase:
+            raise ValueError("Supabase client not initialized")
+        
+        columns = ["city"] + FEATURE_COLS + ["current_aqi", "timestamp"]
+        select_query = ", ".join(columns)
+        
+        response = self.supabase.table("gnn_training_data").select(
+            select_query
+        ).order("timestamp", desc=True).execute()
+        
         if not hasattr(response, "data") or response.data is None:
-            raise ValueError("Supabase fetch failed")
-        raw = pd.DataFrame(response.data)
-        if len(raw) > 0 and isinstance(raw.iloc[0]["city"], dict):
-            raw["city"] = raw["city"].apply(lambda x: x.get("city") if isinstance(x, dict) else x)
-
-        df = raw.drop_duplicates(subset=["city"]).reset_index(drop=True)
-        if df.empty:
-            raise ValueError("No data found in gnn_training_data")
-        self.cities_df = df
-        self.city_to_idx = {city: idx for idx, city in enumerate(df['city'])}
-
-        edges = self._build_proximity_graph()
-        self.edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
-        logger.info(f"Graph has {self.edge_index.shape[1]} edges")
-
-        features = torch.tensor(df[self.config.FEATURE_COLS].fillna(0).values, dtype=torch.float32)
-        self.feature_mean = features.mean(dim=0)
-        self.feature_std = features.std(dim=0) + 1e-6
-
-    def _build_proximity_graph(self):
-        from math import radians, cos, sin, asin, sqrt
-        edges = []
-        def haversine(lat1, lon1, lat2, lon2):
-            lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
-            dlat = lat2 - lat1
-            dlon = lon2 - lon1
-            a = sin(dlat/2)**2 + cos(lat1)*cos(lat2)*sin(dlon/2)**2
-            c = 2 * asin(sqrt(a))
-            return 6371 * c
-        MAX_DIST = 300
-        for i, row1 in self.cities_df.iterrows():
-            for j, row2 in self.cities_df.iterrows():
-                if i == j:
-                    continue
-                if haversine(row1['latitude'], row1['longitude'], row2['latitude'], row2['longitude']) <= MAX_DIST:
-                    edges.append([i, j])
-        if not edges:
-            edges = [[i, i] for i in range(len(self.cities_df))]
-        return edges
-
-    def prepare_realtime_features(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        weather_resp = self.supabase.table("gnn_training_data").select(
-            "city, temperature, humidity, wind_speed, wind_direction, avg_fire_confidence, upwind_fire_count, population_density, current_aqi"
-        ).order("timestamp", desc=True).limit(len(self.city_to_idx)).execute()
-    
-        if not hasattr(weather_resp, "data") or weather_resp.data is None:
-            raise ValueError("Failed to fetch realtime features from Supabase")
-    
-        df = pd.DataFrame(weather_resp.data)
-    
-        for col in ["temperature", "humidity", "wind_speed", "wind_direction", 
-                    "avg_fire_confidence", "upwind_fire_count", 
-                    "population_density", "current_aqi"]:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-    
-        features = []
-        raw_features = []
-        for city in self.cities_df['city']:
-            row = df[df["city"] == city]
-            if len(row) == 0:
-                features.append([25, 70, 5, 90, 0, 0, 1000, 50])
-                raw_features.append([25, 70, 5, 90, 0, 0, 1000, 50])
+            raise ValueError("Failed to fetch data from Supabase")
+        
+        df = response.data
+        
+        city_data = {}
+        seen_cities = set()
+        
+        for row in df:
+            city = row.get("city")
+            if city in seen_cities:
                 continue
+            
+            seen_cities.add(city)
+            city_data[city] = {col: row.get(col) for col in FEATURE_COLS}
+        
+        return city_data
     
-            row = row.iloc[0]
-            feature_vector = [
-                row.temperature, row.humidity, row.wind_speed, row.wind_direction,
-                row.avg_fire_confidence, row.upwind_fire_count,
-                row.population_density, row.current_aqi
-            ]
-            features.append(feature_vector)
-            raw_features.append(feature_vector)
-    
-        X_raw = torch.tensor(raw_features, dtype=torch.float32)
-        X = torch.tensor(features, dtype=torch.float32)
-        X = (X - self.feature_mean) / self.feature_std
-        return X, self.edge_index, X_raw
-
-def build_72h_forecast(
-    model,
-    pipeline: DataPipeline,
-    city: str,
-    weather: Dict,
-    base_pm25: float,
-    device: torch.device,
-    predictor
-) -> List[Dict]:
-    """
-    FIXED: Build 72-hour forecast with proper PM2.5 bounds and AQI calculation
-    """
-    forecast = []
-
-    for key in ["temperature_2m", "relative_humidity_2m", "wind_speed_10m", "wind_direction_10m"]:
-        if len(weather[key]) < 72:
-            weather[key] += [weather[key][-1]] * (72 - len(weather[key]))
-
-    if predictor.last_predictions is None:
-        raise RuntimeError("Predictions not initialized")
-
-    current_preds = predictor.last_predictions
-    current_map = {p["city"]: p for p in current_preds}
-    city_data = pipeline.cities_df[pipeline.cities_df["city"] == city].iloc[0]
-
-    # FIXED: Ensure base_pm25 is within realistic bounds
-    prev_pm25 = max(5.0, min(150.0, base_pm25))
-    
-    neighbor_pm25_map = {}
-    for p in current_preds:
-        neighbor_pm25_map[p["city"]] = p["predicted_pm25"]
-
-    DEFAULT_TEMP = 25.0
-    DEFAULT_HUM = 70.0
-    DEFAULT_WS = 5.0
-    DEFAULT_WD = 90.0
-    DEFAULT_POP = 1000
-
-    for t in range(72):
-        temp = weather["temperature_2m"][t]
-        humidity = weather["relative_humidity_2m"][t]
-        wind_speed = weather["wind_speed_10m"][t]
-        wind_dir = weather["wind_direction_10m"][t]
-
-        all_features = []
-
-        for _, row in pipeline.cities_df.iterrows():
-            live = current_map.get(row["city"])
-
-            if row["city"] == city:
-                # FIXED: Calculate AQI from PM2.5, not the other way around
-                current_aqi = pm25_to_aqi(prev_pm25)
-                
-                if live:
-                    fire = live.get("avg_fire_confidence", 0)
-                    upwind = live.get("upwind_fire_count", 0)
-                    pop = live.get("population_density", DEFAULT_POP)
-                else:
-                    fire, upwind, pop = 0, 0, DEFAULT_POP
-
-                all_features.append([temp, humidity, wind_speed, wind_dir, fire, upwind, pop, current_aqi])
-
+    def predict_current(self) -> List[Dict]:
+        """
+        Run inference on current realtime data
+        """
+        city_data = self.fetch_current_data()
+        
+        features_list = []
+        for city in self.cities:
+            if city in city_data:
+                feature_vector = [
+                    float(city_data[city].get(col, 0)) 
+                    for col in FEATURE_COLS
+                ]
             else:
-                if live:
-                    fire = live.get("avg_fire_confidence", 0)
-                    upwind = live.get("upwind_fire_count", 0)
-                    pop = live.get("population_density", DEFAULT_POP)
-                    
-                    neighbor_pm25 = neighbor_pm25_map.get(row["city"], live["predicted_pm25"])
-                    neighbor_pm25 = 0.98 * neighbor_pm25 + 0.02 * prev_pm25
-                    neighbor_pm25_map[row["city"]] = neighbor_pm25
-                    
-                    neighbor_aqi = pm25_to_aqi(neighbor_pm25)
-                    temp2 = live.get("temperature", DEFAULT_TEMP)
-                    hum2 = live.get("humidity", DEFAULT_HUM)
-                    ws2 = live.get("wind_speed", DEFAULT_WS)
-                    wd2 = live.get("wind_direction", DEFAULT_WD)
-                else:
-                    fire, upwind, pop = 0, 0, DEFAULT_POP
-                    neighbor_aqi = 50
-                    temp2 = DEFAULT_TEMP
-                    hum2 = DEFAULT_HUM
-                    ws2 = DEFAULT_WS
-                    wd2 = DEFAULT_WD
-
-                all_features.append([temp2, hum2, ws2, wd2, fire, upwind, pop, neighbor_aqi])
-
-        X = torch.tensor(all_features, dtype=torch.float32)
-        X = (X - pipeline.feature_mean) / pipeline.feature_std
-        X = X.to(device)
-
+                feature_vector = [0.0] * 7
+                logger.warning(f"City {city} not in realtime data, using zeros")
+            
+            features_list.append(feature_vector)
+        
+        features = np.array(features_list, dtype=np.float32)
+        features_norm = self.normalize_features(features)
+        
+        x = torch.tensor(features_norm, dtype=torch.float32).to(self.device)
+        edge_index = self.edge_index.to(self.device)
+        
         with torch.no_grad():
-            pred, uncertainty = model(X, pipeline.edge_index)
-
-        city_idx = pipeline.city_to_idx[city]
+            pm25_pred, uncertainty = self.model(x, edge_index)
+            pm25_pred = torch.clamp(pm25_pred, min=5.0, max=150.0)
+            
+            pm25_values = pm25_pred.cpu().numpy().flatten()
+            uncertainty_values = uncertainty.cpu().numpy().flatten()
         
-        raw_pm25 = float(pred[city_idx].cpu().numpy())
+        results = []
+        for i, city in enumerate(self.cities):
+            pm25 = float(pm25_values[i])
+            unc = float(uncertainty_values[i])
+            aqi = pm25_to_aqi(pm25)
+            status = aqi_to_category(aqi)
+            
+            results.append({
+                "city": city,
+                "pm25": round(pm25, 2),
+                "aqi": round(aqi, 1),
+                "uncertainty": round(unc, 2),
+                "status": status,
+                "timestamp": datetime.now().isoformat()
+            })
         
-        # FIXED: Apply realistic PM2.5 bounds (5-150 for typical conditions)
-        raw_pm25 = max(5.0, min(150.0, raw_pm25))
+        return results
+    
+    def fetch_forecast_features(self, city: str, hours_ahead: int) -> Dict[str, float]:
+        """
+        Fetch or generate forecast features for a given city and time horizon
+        Applies horizon-aware feature drift as deterministic proxy for temporal evolution
+        """
+        base_features = {}
         
-        # FIXED: More conservative temporal smoothing
-        pm25 = 0.7 * prev_pm25 + 0.3 * raw_pm25
-        pm25 = max(5.0, min(150.0, pm25))
+        if self.supabase:
+            try:
+                response = self.supabase.table("gnn_training_data").select(
+                    ", ".join(["city"] + FEATURE_COLS)
+                ).eq("city", city).order("timestamp", desc=True).limit(1).execute()
+                
+                if response.data and len(response.data) > 0:
+                    row = response.data[0]
+                    base_features = {col: float(row.get(col, 0)) for col in FEATURE_COLS}
+            except Exception as e:
+                logger.error(f"Error fetching forecast features: {e}")
         
-        unc = float(uncertainty[city_idx].cpu().numpy())
+        if not base_features:
+            base_features = {
+                "temperature": 25.0,
+                "humidity": 70.0,
+                "wind_speed": 5.0,
+                "wind_direction": 90.0,
+                "avg_fire_confidence": 0.0,
+                "upwind_fire_count": 0.0,
+                "population_density": 1000.0
+            }
         
-        # FIXED: Calculate AQI from PM2.5
+        factor = hours_ahead / 24.0
+        
+        base_features["temperature"] += 0.7 * factor
+        base_features["humidity"] -= 1.2 * factor
+        base_features["wind_speed"] += 0.15 * factor
+        base_features["avg_fire_confidence"] += 0.08 * factor
+        
+        base_features["humidity"] = max(0, min(100, base_features["humidity"]))
+        base_features["wind_speed"] = max(0, base_features["wind_speed"])
+        base_features["avg_fire_confidence"] = max(0, min(1, base_features["avg_fire_confidence"]))
+        
+        return base_features
+    
+    def is_cache_valid(self, city: str, hour: int) -> bool:
+        """
+        Check if cached forecast is still valid
+        """
+        if city not in self.cache_timestamps or hour not in self.cache_timestamps[city]:
+            return False
+        
+        cached_time = self.cache_timestamps[city][hour]
+        age = datetime.now() - cached_time
+        
+        return age.total_seconds() < FORECAST_CACHE_TTL_HOURS * 3600
+    
+    def is_full_forecast_cache_valid(self, city: str) -> bool:
+        """
+        Check if full forecast cache is still valid
+        """
+        if city not in self.full_forecast_timestamps:
+            return False
+        
+        cached_time = self.full_forecast_timestamps[city]
+        age = datetime.now() - cached_time
+        
+        return age.total_seconds() < FORECAST_CACHE_TTL_HOURS * 3600
+    
+    def forecast_city(self, city: str, hour: int) -> Dict:
+        """
+        Generate forecast for a specific city at a given hour
+        Uses caching to avoid redundant computation
+        """
+        if city not in self.cities:
+            raise ValueError(f"City {city} not in graph")
+        
+        if hour not in FORECAST_HOURS:
+            raise ValueError(f"Hour must be one of {FORECAST_HOURS}")
+        
+        if self.is_cache_valid(city, hour):
+            logger.info(f"Using cached forecast for {city} at hour {hour}")
+            return self.forecast_cache[city][hour]
+        
+        if hour == 0:
+            current_predictions = self.predict_current()
+            for pred in current_predictions:
+                if pred["city"] == city:
+                    result = {
+                        "city": city,
+                        "hour": 0,
+                        "pm25": pred["pm25"],
+                        "aqi": pred["aqi"],
+                        "uncertainty": pred["uncertainty"],
+                        "status": pred["status"],
+                        "timestamp": datetime.now().isoformat()
+                    }
+                    self.forecast_cache[city][0] = result
+                    self.cache_timestamps[city][0] = datetime.now()
+                    return result
+        
+        features_list = []
+        for c in self.cities:
+            forecast_features = self.fetch_forecast_features(c, hour)
+            feature_vector = [forecast_features.get(col, 0.0) for col in FEATURE_COLS]
+            features_list.append(feature_vector)
+        
+        features = np.array(features_list, dtype=np.float32)
+        features_norm = self.normalize_features(features)
+        
+        x = torch.tensor(features_norm, dtype=torch.float32).to(self.device)
+        edge_index = self.edge_index.to(self.device)
+        
+        with torch.no_grad():
+            pm25_pred, uncertainty = self.model(x, edge_index)
+            pm25_pred = torch.clamp(pm25_pred, min=5.0, max=150.0)
+            
+            pm25_values = pm25_pred.cpu().numpy().flatten()
+            uncertainty_values = uncertainty.cpu().numpy().flatten()
+        
+        city_idx = self.city_to_idx[city]
+        pm25 = float(pm25_values[city_idx])
+        unc = float(uncertainty_values[city_idx])
         aqi = pm25_to_aqi(pm25)
-        category = pm25_to_category(pm25)
+        status = aqi_to_category(aqi)
         
-        if t % 12 == 0:
-            logger.info(f"{city} t={t}h | PM2.5={pm25:.1f} | AQI={aqi:.1f} | {category}")
-
-        forecast.append({
-            "hour": t,
-            "temperature": round(temp, 1),
-            "humidity": round(humidity, 1),
-            "wind_speed": round(wind_speed, 1),
+        result = {
+            "city": city,
+            "hour": hour,
             "pm25": round(pm25, 2),
             "aqi": round(aqi, 1),
             "uncertainty": round(unc, 2),
-            "category": category,
-            "timestamp": (datetime.now() + timedelta(hours=t)).isoformat()
-        })
-
-        prev_pm25 = pm25
-
-    return forecast
-
-class PredictionEngine:
-    def __init__(self, model, pipeline: DataPipeline, device: torch.device):
-        self.model = model
-        self.pipeline = pipeline
-        self.device = device
-        self.model.eval()
-        self.last_predictions = None
-        self.last_update = None
-
-    def predict_current(self) -> List[Dict]:
-        """
-        FIXED: Predict current conditions with proper PM2.5 and AQI handling
-        """
-        X, edge_index, X_raw = self.pipeline.prepare_realtime_features()
-        X = X.to(self.device)
-
-        with torch.no_grad():
-            pred, uncertainty = self.model(X, edge_index)
-
-        results = []
-        for idx, city in enumerate(self.pipeline.cities_df['city']):
-            city_data = self.pipeline.cities_df.iloc[idx]
-            
-            # Model outputs PM2.5
-            pm25 = float(pred[idx].cpu().numpy())
-            
-            # FIXED: Apply realistic bounds
-            pm25 = max(5.0, min(150.0, pm25))
-            
-            unc = float(uncertainty[idx].cpu().numpy())
-            
-            # FIXED: Calculate AQI from PM2.5, get category from PM2.5
-            aqi = pm25_to_aqi(pm25)
-            category = pm25_to_category(pm25)
-
-            results.append({
-                'city': city,
-                'latitude': float(city_data['latitude']),
-                'longitude': float(city_data['longitude']),
-                'temperature': float(X_raw[idx][0]),
-                'humidity': float(X_raw[idx][1]),
-                'wind_speed': float(X_raw[idx][2]),
-                'wind_direction': float(X_raw[idx][3]),
-                'avg_fire_confidence': float(X_raw[idx][4]),
-                'upwind_fire_count': float(X_raw[idx][5]),
-                'population_density': float(X_raw[idx][6]),
-                'predicted_pm25': round(pm25, 2),
-                'uncertainty': round(unc, 2),
-                'aqi': round(aqi, 1),
-                'aqi_category': category,
-                'timestamp': datetime.now().isoformat()
-            })
-
-        self.last_predictions = results
-        self.last_update = datetime.now()
+            "status": status,
+            "timestamp": (datetime.now() + timedelta(hours=hour)).isoformat()
+        }
         
-        for r in results:
-            logger.info(
-                "✅ %s | PM2.5=%.1f | AQI=%.0f | %s",
-                r["city"],
-                r["predicted_pm25"],
-                r["aqi"],
-                r["aqi_category"],
-            )
-        return results
+        self.forecast_cache[city][hour] = result
+        self.cache_timestamps[city][hour] = datetime.now()
+        
+        return result
+    
+    def forecast_city_all(self, city: str) -> Dict:
+        """
+        Generate all forecast hours for a city
+        This is the PRIMARY forecast endpoint
+        Optimized for frontend slider usage
+        """
+        if city not in self.cities:
+            raise ValueError(f"City {city} not in graph")
+        
+        if self.is_full_forecast_cache_valid(city):
+            logger.info(f"Using cached full forecast for {city}")
+            return self.full_forecast_cache[city]
+        
+        forecasts = []
+        for hour in FORECAST_HOURS:
+            forecast = self.forecast_city(city, hour)
+            forecasts.append(forecast)
+        
+        result = {
+            "city": city,
+            "hours": FORECAST_HOURS,
+            "generated_at": datetime.now().isoformat(),
+            "forecasts": forecasts
+        }
+        
+        self.full_forecast_cache[city] = result
+        self.full_forecast_timestamps[city] = datetime.now()
+        
+        return result
 
-app = FastAPI(title="HazeRadar API", version="2.0.1-fixed")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
-                   allow_methods=["*"], allow_headers=["*"])
 
-pipeline = None
-predictor = None
-forecast_cache = {}
-scheduler = BackgroundScheduler()
-device = torch.device("cpu")
-
-def update_predictions():
-    global predictor, forecast_cache
-    try:
-        logger.info("🔄 Updating predictions...")
-        preds = predictor.predict_current()
-
-        new_cache = {}
-        for _, row in pipeline.cities_df.iterrows():
-            city = row["city"]
-            lat, lon = row["latitude"], row["longitude"]
-
-            weather = get_future_weather(lat, lon)
-            base_pm25 = next((p["predicted_pm25"] for p in preds if p["city"] == city), 40.0)
-
-            full = build_72h_forecast(
-                predictor.model,
-                pipeline,
-                city,
-                weather,
-                base_pm25,
-                device,
-                predictor
-            )
-            new_cache[city.lower()] = full
-
-        forecast_cache.clear()
-        forecast_cache.update(new_cache)
-        logger.info(f"✅ Updated forecasts for {len(new_cache)} cities")
-
-    except Exception as e:
-        logger.error(f"❌ Prediction update failed: {e}", exc_info=True)
-
-class PredictionResponse(BaseModel):
+class CurrentPrediction(BaseModel):
     city: str
-    latitude: float
-    longitude: float
-    predicted_pm25: float
-    uncertainty: float
-    aqi: float
-    aqi_category: str
-    timestamp: str
-
-class ForecastHourResponse(BaseModel):
-    hour: int
-    temperature: float
-    humidity: float
-    wind_speed: float
     pm25: float
     aqi: float
     uncertainty: float
-    category: str
+    status: str
     timestamp: str
 
-class HealthResponse(BaseModel):
+
+class ForecastPrediction(BaseModel):
+    city: str
+    hour: int
+    pm25: float
+    aqi: float
+    uncertainty: float
     status: str
-    model_loaded: bool
-    last_update: Optional[str]
-    cities_count: int
-    version: str
+    timestamp: str
+
+
+class AllForecastsResponse(BaseModel):
+    city: str
+    hours: List[int]
+    generated_at: str
+    forecasts: List[ForecastPrediction]
+
+
+class ConfigResponse(BaseModel):
+    forecast_hours: List[int]
+    features: List[str]
+    model: str
+    num_cities: int
+
+
+app = FastAPI(
+    title="HazeRadar Inference API",
+    description="GNN-based spatiotemporal air quality forecasting",
+    version="1.0.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+model_manager = ModelManager()
+
 
 @app.on_event("startup")
 async def startup_event():
-    global pipeline, predictor
-    pipeline = DataPipeline(config)
-    pipeline.initialize()
-    pipeline.edge_index = pipeline.edge_index.to(device)
-    
-    model = RealtimeHazeGNN(in_feats=len(config.FEATURE_COLS)).to(device)
-    if os.path.exists(config.MODEL_PATH):
-        model.load_state_dict(torch.load(config.MODEL_PATH, map_location=device))
-        logger.info("✅ Model loaded successfully")
-    else:
-        logger.warning(f"⚠️ Model file not found at {config.MODEL_PATH}")
-    
-    predictor = PredictionEngine(model, pipeline, device)
-    update_predictions()
-    scheduler.add_job(update_predictions, 'interval', seconds=config.UPDATE_INTERVAL)
-    scheduler.start()
-    logger.info("🚀 API ready!")
+    """
+    Load all artifacts and validate configuration on startup
+    """
+    try:
+        model_manager.load_artifacts()
+        logger.info("All artifacts loaded successfully")
+    except Exception as e:
+        logger.error(f"Startup failed: {e}")
+        raise
 
-@app.get("/", response_model=HealthResponse)
+
+@app.get("/")
 async def root():
+    """
+    Health check endpoint
+    """
     return {
         "status": "healthy",
-        "model_loaded": predictor is not None,
-        "last_update": predictor.last_update.isoformat() if predictor.last_update else None,
-        "cities_count": len(pipeline.city_to_idx),
-        "version": "2.0.1-fixed"
+        "service": "HazeRadar Inference API",
+        "version": "1.0.0",
+        "primary_forecast_endpoint": "/api/forecast/{city}/all"
     }
 
-@app.get("/api/predictions/current", response_model=List[PredictionResponse])
-async def get_current_predictions():
-    if predictor.last_predictions is None:
-        raise HTTPException(503, "Predictions not ready yet")
-    return predictor.last_predictions
 
-@app.get("/api/predictions/city/{city_name}", response_model=PredictionResponse)
-async def get_city_prediction(city_name: str):
-    if predictor.last_predictions is None:
-        raise HTTPException(503, "Predictions not ready yet")
-    preds = predictor.last_predictions
-
-    for p in preds:
-        if p['city'].lower() == city_name.lower():
-            return p
-    raise HTTPException(status_code=404, detail=f"City '{city_name}' not found")
-
-@app.get("/api/forecast/{city}", response_model=List[ForecastHourResponse])
-async def forecast_city(city: str):
-    city = unquote(city)
-    city_match = pipeline.cities_df[pipeline.cities_df["city"].str.lower() == city.lower()]
-    if city_match.empty:
-        raise HTTPException(status_code=404, detail=f"City '{city}' not found")
-
-    if predictor.last_predictions is None:
-        raise HTTPException(503, "Predictions not ready yet")
-
-    city_key = city.lower()
-    if city_key not in forecast_cache:
-        raise HTTPException(503, "Forecast not ready yet")
-    
-    forecast_data = forecast_cache[city_key]
-    slider_indices = [0, 12, 24, 36, 48, 60]
-    slider_data = []
-    
-    for idx in slider_indices:
-        if idx < len(forecast_data):
-            point = dict(forecast_data[idx])
-            point['hour'] = idx
-            slider_data.append(point)
-    
-    return slider_data
-
-@app.post("/api/update")
-async def manual_update(background_tasks: BackgroundTasks):
-    background_tasks.add_task(update_predictions)
-    return {"status": "Update triggered"}
-
-@app.get("/api/stats")
-async def stats():
+@app.get("/health")
+async def health():
+    """
+    Detailed health status
+    """
     return {
-        "cities_count": len(pipeline.city_to_idx),
-        "last_update": predictor.last_update.isoformat() if predictor.last_update else None,
-        "graph_edges": pipeline.edge_index.shape[1],
-        "model_params": sum(p.numel() for p in predictor.model.parameters())
+        "status": "healthy",
+        "model_loaded": model_manager.model is not None,
+        "cities_count": len(model_manager.cities) if model_manager.cities else 0,
+        "features": FEATURE_COLS,
+        "forecast_hours": FORECAST_HOURS
     }
+
+
+@app.get("/api/config", response_model=ConfigResponse)
+async def get_config():
+    """
+    Get API configuration for frontend
+    Frontend should use this to configure slider mappings
+    Example: const selectedHour = config.forecast_hours[sliderIndex]
+    """
+    return {
+        "forecast_hours": FORECAST_HOURS,
+        "features": FEATURE_COLS,
+        "model": "GATv2",
+        "num_cities": len(model_manager.cities) if model_manager.cities else 0
+    }
+
+
+@app.get("/api/predictions/current", response_model=List[CurrentPrediction])
+async def get_current_predictions():
+    """
+    Get current PM2.5 predictions for all cities
+    """
+    try:
+        predictions = model_manager.predict_current()
+        return predictions
+    except Exception as e:
+        logger.error(f"Current prediction failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/forecast/{city}/all", response_model=AllForecastsResponse)
+async def get_all_city_forecasts(city: str):
+    """
+    PRIMARY FORECAST ENDPOINT
+    Get all forecast hours for a city in one call
+    
+    This is optimized for frontend slider usage
+    Frontend should:
+    1. Call this endpoint once on city selection
+    2. Store the forecasts array
+    3. Map slider index to forecast using: forecasts[sliderIndex]
+    
+    Example response:
+    {
+        "city": "Jakarta",
+        "hours": [0, 12, 24, 36, 48, 60],
+        "generated_at": "2025-01-18T10:30:00",
+        "forecasts": [...]
+    }
+    """
+    try:
+        result = model_manager.forecast_city_all(city)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error(f"All forecasts failed for {city}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/cities")
+async def get_cities():
+    """
+    List all supported cities
+    """
+    return {
+        "cities": model_manager.cities,
+        "count": len(model_manager.cities)
+    }
+
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=config.PORT)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
