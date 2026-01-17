@@ -423,15 +423,22 @@ class ModelManager:
                         # Combine all factors with realistic bounds
                         combined_factor = temp_factor * wind_factor * fire_factor * diurnal_factor * random_factor
                         
-                        # Apply gradual change: limit to ±15% per 12 hours
-                        max_change = 1 + (0.15 * (target_hour / 12.0))
-                        min_change = 1 - (0.15 * (target_hour / 12.0))
-                        combined_factor = max(min_change, min(max_change, combined_factor))
+                        # Special damping for first 12 hours to prevent jumps
+                        if target_hour == 12:
+                            # Limit first step to max ±8% change
+                            combined_factor = max(0.92, min(1.08, combined_factor))
+                        else:
+                            # Apply gradual change: limit to ±12% per 12-hour period
+                            hours_from_start = target_hour / 12.0
+                            max_change = 1 + (0.12 * hours_from_start)
+                            min_change = 1 - (0.12 * hours_from_start)
+                            combined_factor = max(min_change, min(max_change, combined_factor))
                         
                         pm25 = base_pm25 * combined_factor
                         
-                        # Realistic bounds: ±30% max from baseline
-                        pm25 = max(base_pm25 * 0.7, min(pm25, base_pm25 * 1.3))
+                        # Realistic bounds: ±25% max from baseline over full 60h period
+                        max_deviation = 0.25 * (target_hour / 60.0)
+                        pm25 = max(base_pm25 * (1 - max_deviation), min(pm25, base_pm25 * (1 + max_deviation)))
                         pm25 = max(5.0, pm25)
                     
                     aqi = pm25_to_aqi(pm25)
