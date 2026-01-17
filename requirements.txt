@@ -1,8 +1,8 @@
 fastapi
 uvicorn[standard]
+numpy<2.0.0
 torch==2.2.2
 torch-geometric
-numpy
 pydantic
 supabase
 aiohttp
