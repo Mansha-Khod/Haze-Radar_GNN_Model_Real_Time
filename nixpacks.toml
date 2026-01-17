@@ -11,13 +11,4 @@ cmds = [
 
 [start]
 cmd = "python3.10 -m uvicorn main:app --host 0.0.0.0 --port $PORT"
-```
 
-This explicitly ensures pip is installed before using it.
-
-**Alternative: Let Railway auto-detect** (simplest option)
-
-Delete `nixpacks.toml` entirely and create a simple `Procfile`:
-```
-# Procfile
-web: uvicorn main:app --host 0.0.0.0 --port $PORT
