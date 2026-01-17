@@ -1,20 +1,12 @@
 # requirements.txt
-# PyTorch CPU-only
---index-url https://download.pytorch.org/whl/cpu
 torch==2.2.2
+pyg-lib torch-scatter torch-sparse torch-cluster torch-spline-conv -f https://data.pyg.org/whl/torch-2.2.2+cpu.html
+torch-geometric==2.5.3
 
-# PyTorch Geometric (let pip resolve dependencies)
-torch-geometric
-
-# Core
-numpy
-pandas
-
-# API
+numpy==1.24.3
+pandas==2.0.3
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
 pydantic==2.5.0
-
-# Database
 supabase==2.4.5
 python-dotenv==1.0.0
