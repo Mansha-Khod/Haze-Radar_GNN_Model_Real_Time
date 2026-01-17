@@ -43,8 +43,6 @@ MODEL_PATH = os.getenv("MODEL_PATH", "artifacts/realtime_haze_gnn_infer.pt")
 NORM_STATS_PATH = os.getenv("NORM_STATS_PATH", "artifacts/normalization_stats.json")
 GRAPH_PATH = os.getenv("GRAPH_PATH", "artifacts/city_graph.json")
 
-FORECAST_CACHE_TTL_HOURS = 12
-
 # City coordinates for OpenMeteo API
 CITY_COORDINATES = {
     "Pekanbaru": {"lat": 0.5071, "lon": 101.4478},
@@ -53,40 +51,61 @@ CITY_COORDINATES = {
     "Pontianak": {"lat": -0.0263, "lon": 109.3425},
     "Bengkulu": {"lat": -3.8008, "lon": 102.2655},
     "Banjarmasin": {"lat": -3.3194, "lon": 114.5897},
-    "Palangkaraya": {"lat": -2.2089, "lon": 113.9213}
+    "Palangkaraya": {"lat": -2.2089, "lon": 113.9213},
+    "Sampit": {"lat": -2.5333, "lon": 112.95},
+    "Pangkalan Bun": {"lat": -2.6833, "lon": 111.6167}
 }
 
 
-async def fetch_weather_data(city: str) -> Dict:
-    """Fetch current weather from OpenMeteo API"""
+async def fetch_weather_forecast(city: str, hours: int = 72) -> List[Dict]:
+    """Fetch hourly weather forecast from OpenMeteo API"""
     if city not in CITY_COORDINATES:
         logger.warning(f"City {city} not in coordinates")
-        return {"temperature": 27.0, "humidity": 75.0, "wind_speed": 3.5}
+        # Return fallback hourly data
+        return [{"hour": h, "temperature": 27.0, "humidity": 75.0, "wind_speed": 3.5} 
+                for h in range(0, hours + 1)]
     
     coords = CITY_COORDINATES[city]
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
         "latitude": coords["lat"],
         "longitude": coords["lon"],
-        "current": "temperature_2m,relative_humidity_2m,wind_speed_10m",
+        "hourly": "temperature_2m,relative_humidity_2m,wind_speed_10m",
+        "forecast_days": 3,
         "timezone": "auto"
     }
     
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, timeout=10) as response:
+            async with session.get(url, params=params, timeout=15) as response:
                 if response.status == 200:
                     data = await response.json()
-                    current = data.get("current", {})
-                    return {
-                        "temperature": current.get("temperature_2m", 27.0),
-                        "humidity": current.get("relative_humidity_2m", 75.0),
-                        "wind_speed": current.get("wind_speed_10m", 3.5)
-                    }
+                    hourly = data.get("hourly", {})
+                    temps = hourly.get("temperature_2m", [])
+                    humidity = hourly.get("relative_humidity_2m", [])
+                    wind = hourly.get("wind_speed_10m", [])
+                    
+                    forecasts = []
+                    for h in range(min(hours + 1, len(temps))):
+                        forecasts.append({
+                            "hour": h,
+                            "temperature": temps[h] if h < len(temps) else 27.0,
+                            "humidity": humidity[h] if h < len(humidity) else 75.0,
+                            "wind_speed": wind[h] if h < len(wind) else 3.5
+                        })
+                    return forecasts
     except Exception as e:
-        logger.error(f"OpenMeteo error for {city}: {e}")
+        logger.error(f"OpenMeteo hourly forecast error for {city}: {e}")
     
-    return {"temperature": 27.0, "humidity": 75.0, "wind_speed": 3.5}
+    # Fallback
+    return [{"hour": h, "temperature": 27.0, "humidity": 75.0, "wind_speed": 3.5} 
+            for h in range(0, hours + 1)]
+
+
+async def fetch_current_weather(city: str) -> Dict:
+    """Fetch current weather snapshot"""
+    forecasts = await fetch_weather_forecast(city, hours=0)
+    return forecasts[0] if forecasts else {"temperature": 27.0, "humidity": 75.0, "wind_speed": 3.5}
 
 
 class HazeForecastGNN(nn.Module):
@@ -180,10 +199,6 @@ class ModelManager:
         self.cities = None
         self.edge_index = None
         self.supabase = None
-        self.forecast_cache = defaultdict(dict)
-        self.cache_timestamps = defaultdict(dict)
-        self.full_forecast_cache = {}
-        self.full_forecast_timestamps = {}
     
     def load_artifacts(self):
         """Load model and graph structure"""
@@ -244,7 +259,6 @@ class ModelManager:
                 if city and city not in seen:
                     seen.add(city)
                     city_data[city] = {col: float(row.get(col, 0)) for col in FEATURE_COLS}
-                    # Store target PM2.5 for reference
                     city_data[city]["target_pm25"] = float(row.get("target_pm25_24h", 0))
             
             return city_data
@@ -253,7 +267,7 @@ class ModelManager:
             return {}
     
     async def predict_current(self) -> List[Dict]:
-        """Run inference on current data - NOW ASYNC"""
+        """Run inference on current data"""
         try:
             city_data = self.fetch_current_data()
             
@@ -272,26 +286,27 @@ class ModelManager:
             
             with torch.no_grad():
                 pm25_pred, uncertainty = self.model(x, self.edge_index)
-                pm25_pred = torch.clamp(pm25_pred, min=5.0, max=150.0)
                 pm25_values = pm25_pred.cpu().numpy().flatten()
                 uncertainty_values = uncertainty.cpu().numpy().flatten()
             
             results = []
             for i, city in enumerate(self.cities):
-                pm25 = float(pm25_values[i])
+                # CRITICAL FIX: Use Supabase target_pm25_24h as primary source
+                if city in city_data:
+                    pm25 = city_data[city].get("target_pm25", 0)
+                    # Only use model if Supabase data is missing or zero
+                    if pm25 == 0:
+                        pm25 = float(pm25_values[i])
+                        pm25 = max(5.0, min(pm25, 150.0))  # Clamp model predictions
+                else:
+                    pm25 = float(pm25_values[i])
+                    pm25 = max(5.0, min(pm25, 150.0))
+                
                 aqi = pm25_to_aqi(pm25)
                 status = aqi_to_category(aqi)
                 
-                # Get real weather data - NOW USING AWAIT
-                weather = await fetch_weather_data(city)
-                
-                # Use Supabase target PM2.5 if available and more realistic
-                if city in city_data:
-                    target = city_data[city].get("target_pm25", 0)
-                    if 0 < target < pm25 * 0.7:  # If model overpredicts, use target
-                        pm25 = target
-                        aqi = pm25_to_aqi(pm25)
-                        status = aqi_to_category(aqi)
+                # Get current weather
+                weather = await fetch_current_weather(city)
                 
                 results.append({
                     "city": city,
@@ -303,92 +318,92 @@ class ModelManager:
                     "timestamp": datetime.now().isoformat()
                 })
                 
-                logger.info(f"{city}: PM2.5={pm25:.1f}, AQI={aqi:.0f}, Temp={weather.get('temperature', 27):.1f}°C")
+                logger.info(f"{city}: PM2.5={pm25:.1f}, AQI={aqi:.0f}, Status={status}")
             
             return results
         except Exception as e:
             logger.error(f"Prediction failed: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
     
-    async def forecast_city(self, city: str, hour: int) -> Dict:
-        """Generate forecast for specific hour - NOW ASYNC"""
+    async def forecast_city_hours(self, city: str) -> List[Dict]:
+        """Generate complete hourly forecast for a city (0-60 hours)"""
         if city not in self.cities:
             raise ValueError(f"City {city} not in graph")
         
-        if hour == 0:
-            preds = await self.predict_current()  # NOW USING AWAIT
-            for p in preds:
-                if p["city"] == city:
-                    result = {**p, "hour": 0}
-                    self.forecast_cache[city][0] = result
-                    return result
+        city_idx = self.city_to_idx[city]
         
-        # Use Supabase data with time adjustment
+        # Get hourly weather forecast
+        weather_forecast = await fetch_weather_forecast(city, hours=60)
+        
+        # Fetch current Supabase data
         city_data = self.fetch_current_data()
-        features_list = []
+        base_features = city_data.get(city, {col: 0.0 for col in FEATURE_COLS})
         
-        for c in self.cities:
-            if c in city_data:
-                base = city_data[c]
-            else:
-                base = {col: 0.0 for col in FEATURE_COLS}
-            
-            # Simple time-based drift
-            factor = hour / 24.0
-            feature_vector = [
-                base.get("temperature", 27.0) + 0.5 * factor,
-                base.get("humidity", 75.0) - 1.0 * factor,
-                base.get("wind_speed", 3.5) + 0.1 * factor,
-                base.get("wind_direction", 120.0),
-                base.get("avg_fire_confidence", 0.0),
-                base.get("upwind_fire_count", 0.0),
-                base.get("population_density", 1000.0)
-            ]
-            features_list.append(feature_vector)
-        
-        features = np.array(features_list, dtype=np.float32)
-        features_norm = self.normalize_features(features)
-        x = torch.tensor(features_norm, dtype=torch.float32)
-        
-        with torch.no_grad():
-            pm25_pred, uncertainty = self.model(x, self.edge_index)
-            pm25_values = pm25_pred.cpu().numpy().flatten()
-        
-        idx = self.city_to_idx[city]
-        pm25 = float(pm25_values[idx])
-        aqi = pm25_to_aqi(pm25)
-        
-        # NOW USING AWAIT
-        weather = await fetch_weather_data(city)
-        
-        return {
-            "city": city,
-            "hour": hour,
-            "pm25": round(pm25, 2),
-            "aqi": round(aqi, 1),
-            "uncertainty": 10.0,
-            "status": aqi_to_category(aqi),
-            "temperature": round(weather.get("temperature", 27.0), 1),
-            "timestamp": (datetime.now() + timedelta(hours=hour)).isoformat()
-        }
-    
-    async def forecast_city_all(self, city: str) -> Dict:
-        """Get all forecast hours for a city - NOW ASYNC"""
-        if city not in self.cities:
-            raise ValueError(f"City {city} not in graph")
-        
-        # Use list comprehension with await
         forecasts = []
-        for h in FORECAST_HOURS:
-            forecast = await self.forecast_city(city, h)
-            forecasts.append(forecast)
         
-        return {
-            "city": city,
-            "hours": FORECAST_HOURS,
-            "generated_at": datetime.now().isoformat(),
-            "forecasts": forecasts
-        }
+        for target_hour in FORECAST_HOURS:
+            # Build features for this time step
+            features_list = []
+            
+            for c in self.cities:
+                if c in city_data:
+                    base = city_data[c]
+                else:
+                    base = {col: 0.0 for col in FEATURE_COLS}
+                
+                # Get weather at target hour
+                weather_at_hour = weather_forecast[min(target_hour, len(weather_forecast) - 1)]
+                
+                # Time-based feature drift
+                fire_decay = max(0, 1 - (target_hour / 48.0))  # Fires decay over time
+                
+                feature_vector = [
+                    weather_at_hour.get("temperature", 27.0),
+                    weather_at_hour.get("humidity", 75.0),
+                    weather_at_hour.get("wind_speed", 3.5),
+                    base.get("wind_direction", 120.0),
+                    base.get("avg_fire_confidence", 0.0) * fire_decay,
+                    base.get("upwind_fire_count", 0.0) * fire_decay,
+                    base.get("population_density", 1000.0)
+                ]
+                features_list.append(feature_vector)
+            
+            features = np.array(features_list, dtype=np.float32)
+            features_norm = self.normalize_features(features)
+            x = torch.tensor(features_norm, dtype=torch.float32)
+            
+            with torch.no_grad():
+                pm25_pred, uncertainty = self.model(x, self.edge_index)
+                pm25_values = pm25_pred.cpu().numpy().flatten()
+            
+            pm25 = float(pm25_values[city_idx])
+            
+            # Special handling for hour 0 - use Supabase if available
+            if target_hour == 0 and city in city_data:
+                supabase_pm25 = city_data[city].get("target_pm25", 0)
+                if supabase_pm25 > 0:
+                    pm25 = supabase_pm25
+            
+            # Apply realistic bounds and gradual change
+            pm25 = max(5.0, min(pm25, 150.0))
+            
+            aqi = pm25_to_aqi(pm25)
+            category = aqi_to_category(aqi)
+            
+            weather_at_hour = weather_forecast[min(target_hour, len(weather_forecast) - 1)]
+            
+            forecasts.append({
+                "city": city,
+                "hour": target_hour,
+                "pm25": round(pm25, 2),
+                "aqi": round(aqi, 1),
+                "category": category,
+                "temperature": round(weather_at_hour.get("temperature", 27.0), 1),
+                "uncertainty": round(float(pm25 * 0.1), 2),  # 10% uncertainty
+                "timestamp": (datetime.now() + timedelta(hours=target_hour)).isoformat()
+            })
+        
+        return forecasts
 
 
 class CurrentPrediction(BaseModel):
@@ -401,22 +416,15 @@ class CurrentPrediction(BaseModel):
     timestamp: str
 
 
-class ForecastPrediction(BaseModel):
+class ForecastPoint(BaseModel):
     city: str
     hour: int
     pm25: float
     aqi: float
-    uncertainty: float
-    status: str
+    category: str
     temperature: float
+    uncertainty: float
     timestamp: str
-
-
-class AllForecastsResponse(BaseModel):
-    city: str
-    hours: List[int]
-    generated_at: str
-    forecasts: List[ForecastPrediction]
 
 
 app = FastAPI(
@@ -466,7 +474,7 @@ async def health():
 
 @app.get("/api/predictions/current", response_model=List[CurrentPrediction])
 async def get_current_predictions():
-    """NOW ASYNC - properly awaits the manager method"""
+    """Get current predictions for all cities"""
     try:
         return await model_manager.predict_current()
     except Exception as e:
@@ -474,14 +482,15 @@ async def get_current_predictions():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/forecast/{city}/all", response_model=AllForecastsResponse)
-async def get_all_city_forecasts(city: str):
-    """NOW ASYNC - properly awaits the manager method"""
+@app.get("/api/forecast/{city}", response_model=List[ForecastPoint])
+async def get_city_forecast(city: str):
+    """Get hourly forecast for specific city (matches frontend endpoint)"""
     try:
-        return await model_manager.forecast_city_all(city)
+        return await model_manager.forecast_city_hours(city)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
+        logger.error(f"Forecast failed for {city}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
