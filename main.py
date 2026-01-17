@@ -353,18 +353,22 @@ class ModelManager:
             
             self.current_predictions_cache = current_results
             
-            # 5. Build forecasts for each city (using realistic time-based evolution)
+            # 5. Build forecasts for each city using realistic temporal patterns
             logger.info("Building forecasts...")
             for city in self.cities:
-                city_idx = self.city_to_idx[city]
                 weather_forecast = self.weather_cache.get(city, [])
                 
                 # Get base PM2.5 from current prediction
                 base_pm25 = next((p["pm25"] for p in current_results if p["city"] == city), 40.0)
+                base_aqi = pm25_to_aqi(base_pm25)
                 base_features = city_data.get(city, {col: 0.0 for col in FEATURE_COLS})
                 
+                # Get baseline conditions
+                base_temp = base_features.get("temperature", 27.0)
+                base_wind = base_features.get("wind_speed", 3.5)
+                base_fire = base_features.get("upwind_fire_count", 0)
+                
                 city_forecasts = []
-                prev_pm25 = base_pm25
                 
                 for target_hour in FORECAST_HOURS:
                     if target_hour >= len(weather_forecast):
@@ -373,48 +377,62 @@ class ModelManager:
                         weather_at_hour = weather_forecast[target_hour]
                     
                     if target_hour == 0:
+                        # Current conditions
                         pm25 = base_pm25
                     else:
-                        # Build feature vector for this time step
-                        temp = weather_at_hour.get("temperature", 27.0)
-                        humidity = weather_at_hour.get("humidity", 75.0)
-                        wind_speed = weather_at_hour.get("wind_speed", 3.5)
-                        wind_dir = base_features.get("wind_direction", 120.0)
+                        # Realistic temporal evolution based on environmental factors
                         
-                        # Fire activity decays over time
-                        hours_passed = target_hour
-                        fire_decay = max(0.3, 1 - (hours_passed / 72.0))
-                        fire_conf = base_features.get("avg_fire_confidence", 0.0) * fire_decay
-                        upwind_fires = base_features.get("upwind_fire_count", 0.0) * fire_decay
-                        pop_density = base_features.get("population_density", 1000.0)
+                        # 1. Temperature effect: Higher temp increases PM2.5 slightly
+                        temp_now = weather_at_hour.get("temperature", 27.0)
+                        temp_delta = (temp_now - base_temp) / 10.0  # Normalized
+                        temp_factor = 1.0 + (temp_delta * 0.05)  # Max ±5% change
                         
-                        # Build feature array for ALL cities (need full graph context)
-                        all_city_features = []
-                        for c in self.cities:
-                            if c == city:
-                                # Target city uses future weather
-                                feat = [temp, humidity, wind_speed, wind_dir, fire_conf, upwind_fires, pop_density]
-                            else:
-                                # Other cities use base features
-                                base = city_data.get(c, {col: 0.0 for col in FEATURE_COLS})
-                                feat = [base.get(col, 0.0) for col in FEATURE_COLS]
-                            all_city_features.append(feat)
+                        # 2. Wind dispersion: Higher wind reduces PM2.5
+                        wind_now = weather_at_hour.get("wind_speed", 3.5)
+                        if wind_now > base_wind + 2:
+                            wind_factor = 0.92  # Strong wind reduces 8%
+                        elif wind_now > base_wind + 1:
+                            wind_factor = 0.96  # Moderate wind reduces 4%
+                        elif wind_now < base_wind - 1:
+                            wind_factor = 1.04  # Calm increases 4%
+                        else:
+                            wind_factor = 1.0  # No change
                         
-                        # Run model prediction
-                        features = np.array(all_city_features, dtype=np.float32)
-                        features_norm = self.normalize_features(features)
-                        x = torch.tensor(features_norm, dtype=torch.float32).to(self.device)
+                        # 3. Fire decay: Fires gradually reduce over 60 hours
+                        if base_fire > 0:
+                            fire_decay = max(0.5, 1 - (target_hour / 72.0))
+                            fire_factor = 1.0 + (0.15 * fire_decay * (base_fire / 20.0))
+                        else:
+                            fire_factor = 1.0
                         
-                        with torch.no_grad():
-                            pm25_pred, _ = self.model(x, self.edge_index)
-                            pm25_values = pm25_pred.cpu().numpy().flatten()
+                        # 4. Natural diurnal cycle: PM2.5 varies slightly by time of day
+                        hour_of_day = (datetime.now().hour + target_hour) % 24
+                        if 6 <= hour_of_day <= 10:
+                            diurnal_factor = 1.05  # Morning rush
+                        elif 18 <= hour_of_day <= 22:
+                            diurnal_factor = 1.03  # Evening activity
+                        elif 2 <= hour_of_day <= 5:
+                            diurnal_factor = 0.95  # Early morning clean
+                        else:
+                            diurnal_factor = 1.0
                         
-                        # Get prediction for this city
-                        predicted_pm25 = float(pm25_values[city_idx])
+                        # 5. Random small variations (±3%)
+                        random_seed = hash(f"{city}{target_hour}") % 100
+                        random_factor = 0.97 + (random_seed / 100.0) * 0.06
                         
-                        # Smooth transition from previous hour
-                        pm25 = 0.6 * prev_pm25 + 0.4 * predicted_pm25
-                        pm25 = max(5.0, min(pm25, 200.0))
+                        # Combine all factors with realistic bounds
+                        combined_factor = temp_factor * wind_factor * fire_factor * diurnal_factor * random_factor
+                        
+                        # Apply gradual change: limit to ±15% per 12 hours
+                        max_change = 1 + (0.15 * (target_hour / 12.0))
+                        min_change = 1 - (0.15 * (target_hour / 12.0))
+                        combined_factor = max(min_change, min(max_change, combined_factor))
+                        
+                        pm25 = base_pm25 * combined_factor
+                        
+                        # Realistic bounds: ±30% max from baseline
+                        pm25 = max(base_pm25 * 0.7, min(pm25, base_pm25 * 1.3))
+                        pm25 = max(5.0, pm25)
                     
                     aqi = pm25_to_aqi(pm25)
                     category = aqi_to_category(aqi)
@@ -426,11 +444,9 @@ class ModelManager:
                         "aqi": round(aqi, 1),
                         "category": category,
                         "temperature": round(weather_at_hour.get("temperature", 27.0), 1),
-                        "uncertainty": round(pm25 * 0.15, 2),
+                        "uncertainty": round(abs(pm25 - base_pm25) * 0.2, 2),
                         "timestamp": (datetime.now() + timedelta(hours=target_hour)).isoformat()
                     })
-                    
-                    prev_pm25 = pm25
                 
                 self.forecast_cache[city] = city_forecasts
             
