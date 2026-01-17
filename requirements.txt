@@ -1,12 +1,23 @@
 # requirements.txt
+# Install PyTorch CPU version first
 torch==2.2.2
-pyg-lib torch-scatter torch-sparse torch-cluster torch-spline-conv -f https://data.pyg.org/whl/torch-2.2.2+cpu.html
-torch-geometric==2.5.3
 
+# Install torch-geometric and dependencies
+torch-scatter
+torch-sparse
+torch-cluster
+torch-spline-conv
+torch-geometric
+
+# Core dependencies
 numpy==1.24.3
 pandas==2.0.3
+
+# FastAPI
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
 pydantic==2.5.0
+
+# Supabase
 supabase==2.4.5
 python-dotenv==1.0.0
