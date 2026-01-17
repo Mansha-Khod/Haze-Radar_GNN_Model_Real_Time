@@ -6,3 +6,4 @@ torch-geometric
 pydantic
 supabase
 aiohttp
+apscheduler
