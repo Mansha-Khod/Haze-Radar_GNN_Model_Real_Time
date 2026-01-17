@@ -1,4 +1,4 @@
-# requirements.txt (for Dockerfile approach)
+# requirements.txt
 numpy==1.24.3
 pandas==2.0.3
 fastapi==0.104.1
