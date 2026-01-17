@@ -1,12 +1,11 @@
+# nixpacks.toml
 [phases.setup]
-nixPkgs = ["python310", "gcc"]
+nixPkgs = ["python310"]
 
 [phases.install]
 cmds = [
-  "python3.10 -m venv /opt/venv",
-  ". /opt/venv/bin/activate",
-  "pip install --upgrade pip",
-  "pip install -r requirements.txt"
+  "pip install --no-cache-dir --upgrade pip",
+  "pip install --no-cache-dir -r requirements.txt"
 ]
 
 [start]
