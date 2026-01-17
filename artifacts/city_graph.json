@@ -1,0 +1,90 @@
+{
+  "edges": [
+    [
+      0,
+      0
+    ],
+    [
+      1,
+      2
+    ],
+    [
+      1,
+      3
+    ],
+    [
+      2,
+      1
+    ],
+    [
+      2,
+      3
+    ],
+    [
+      3,
+      1
+    ],
+    [
+      3,
+      2
+    ],
+    [
+      4,
+      6
+    ],
+    [
+      5,
+      5
+    ],
+    [
+      6,
+      4
+    ]
+  ],
+  "city_to_idx": {
+    "Pekanbaru": 0,
+    "Palangkaraya": 1,
+    "Sampit": 2,
+    "Pangkalan Bun": 3,
+    "Palembang": 4,
+    "Pontianak": 5,
+    "Jambi": 6
+  },
+  "cities": [
+    {
+      "city": "Pekanbaru",
+      "latitude": 0.5071,
+      "longitude": 101.4478
+    },
+    {
+      "city": "Palangkaraya",
+      "latitude": -2.2086,
+      "longitude": 113.9167
+    },
+    {
+      "city": "Sampit",
+      "latitude": -2.5333,
+      "longitude": 112.95
+    },
+    {
+      "city": "Pangkalan Bun",
+      "latitude": -2.6833,
+      "longitude": 111.6167
+    },
+    {
+      "city": "Palembang",
+      "latitude": -2.991,
+      "longitude": 104.7574
+    },
+    {
+      "city": "Pontianak",
+      "latitude": -0.0226,
+      "longitude": 109.3425
+    },
+    {
+      "city": "Jambi",
+      "latitude": -1.61,
+      "longitude": 103.6072
+    }
+  ]
+}
