@@ -11,7 +11,6 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from collections import defaultdict
 import aiohttp
-import asyncio
 
 import torch
 import torch.nn as nn
@@ -253,8 +252,8 @@ class ModelManager:
             logger.error(f"Supabase fetch failed: {e}")
             return {}
     
-    def predict_current(self) -> List[Dict]:
-        """Run inference on current data"""
+    async def predict_current(self) -> List[Dict]:
+        """Run inference on current data - NOW ASYNC"""
         try:
             city_data = self.fetch_current_data()
             
@@ -283,8 +282,8 @@ class ModelManager:
                 aqi = pm25_to_aqi(pm25)
                 status = aqi_to_category(aqi)
                 
-                # Get real weather data
-                weather = asyncio.run(fetch_weather_data(city))
+                # Get real weather data - NOW USING AWAIT
+                weather = await fetch_weather_data(city)
                 
                 # Use Supabase target PM2.5 if available and more realistic
                 if city in city_data:
@@ -311,13 +310,13 @@ class ModelManager:
             logger.error(f"Prediction failed: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
     
-    def forecast_city(self, city: str, hour: int) -> Dict:
-        """Generate forecast for specific hour"""
+    async def forecast_city(self, city: str, hour: int) -> Dict:
+        """Generate forecast for specific hour - NOW ASYNC"""
         if city not in self.cities:
             raise ValueError(f"City {city} not in graph")
         
         if hour == 0:
-            preds = self.predict_current()
+            preds = await self.predict_current()  # NOW USING AWAIT
             for p in preds:
                 if p["city"] == city:
                     result = {**p, "hour": 0}
@@ -359,7 +358,8 @@ class ModelManager:
         pm25 = float(pm25_values[idx])
         aqi = pm25_to_aqi(pm25)
         
-        weather = asyncio.run(fetch_weather_data(city))
+        # NOW USING AWAIT
+        weather = await fetch_weather_data(city)
         
         return {
             "city": city,
@@ -372,12 +372,16 @@ class ModelManager:
             "timestamp": (datetime.now() + timedelta(hours=hour)).isoformat()
         }
     
-    def forecast_city_all(self, city: str) -> Dict:
-        """Get all forecast hours for a city"""
+    async def forecast_city_all(self, city: str) -> Dict:
+        """Get all forecast hours for a city - NOW ASYNC"""
         if city not in self.cities:
             raise ValueError(f"City {city} not in graph")
         
-        forecasts = [self.forecast_city(city, h) for h in FORECAST_HOURS]
+        # Use list comprehension with await
+        forecasts = []
+        for h in FORECAST_HOURS:
+            forecast = await self.forecast_city(city, h)
+            forecasts.append(forecast)
         
         return {
             "city": city,
@@ -462,8 +466,9 @@ async def health():
 
 @app.get("/api/predictions/current", response_model=List[CurrentPrediction])
 async def get_current_predictions():
+    """NOW ASYNC - properly awaits the manager method"""
     try:
-        return model_manager.predict_current()
+        return await model_manager.predict_current()
     except Exception as e:
         logger.error(f"Endpoint failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -471,8 +476,9 @@ async def get_current_predictions():
 
 @app.get("/api/forecast/{city}/all", response_model=AllForecastsResponse)
 async def get_all_city_forecasts(city: str):
+    """NOW ASYNC - properly awaits the manager method"""
     try:
-        return model_manager.forecast_city_all(city)
+        return await model_manager.forecast_city_all(city)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
