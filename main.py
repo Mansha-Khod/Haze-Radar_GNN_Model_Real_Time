@@ -233,29 +233,45 @@ class ModelManager:
         return (features - self.feature_mean) / self.feature_std
     
     def fetch_current_data(self) -> Dict[str, Dict]:
-        """Fetch latest data from Supabase"""
+        """Fetch latest data from Supabase - ONE ROW PER CITY (most recent)"""
         if not self.supabase:
             logger.warning("No Supabase client")
             return {}
         
         try:
+            # Fetch last 10 rows per city to ensure we get the most recent
             response = self.supabase.table("gnn_training_data").select(
-                "city," + ",".join(FEATURE_COLS) + ",target_pm25_24h"
-            ).order("timestamp", desc=True).limit(50).execute()
+                "city," + ",".join(FEATURE_COLS) + ",target_pm25_24h,timestamp"
+            ).order("timestamp", desc=True).limit(100).execute()
             
             if not response.data:
+                logger.warning("No data returned from Supabase")
                 return {}
             
             city_data = {}
             seen = set()
+            
+            # Take ONLY the first occurrence of each city (most recent timestamp)
             for row in response.data:
                 city = row.get("city")
-                if city and city not in seen:
-                    seen.add(city)
-                    city_data[city] = {col: float(row.get(col, 0)) for col in FEATURE_COLS}
-                    city_data[city]["target_pm25"] = float(row.get("target_pm25_24h", 0))
+                if not city or city in seen:
+                    continue
+                
+                seen.add(city)
+                
+                # Store all features
+                city_data[city] = {col: float(row.get(col, 0)) for col in FEATURE_COLS}
+                
+                # CRITICAL: Store target_pm25_24h separately
+                target = float(row.get("target_pm25_24h", 0))
+                city_data[city]["target_pm25"] = target
+                
+                # Debug log
+                logger.debug(f"  📥 Fetched {city}: target_pm25_24h={target:.2f}, timestamp={row.get('timestamp')}")
             
+            logger.info(f"✅ Fetched data for {len(city_data)} cities from Supabase")
             return city_data
+            
         except Exception as e:
             logger.error(f"Supabase fetch failed: {e}")
             return {}
@@ -295,17 +311,24 @@ class ModelManager:
                 uncertainty_values = uncertainty.cpu().numpy().flatten()
             
             # 4. Build current predictions
+            logger.info("📊 Building current predictions...")
             current_results = []
             for i, city in enumerate(self.cities):
-                # Priority: Use Supabase target_pm25_24h
+                # CRITICAL FIX: Always use Supabase data when available
+                supabase_pm25 = None
                 if city in city_data:
-                    pm25 = city_data[city].get("target_pm25", 0)
-                    if pm25 == 0:  # Fallback to model
-                        pm25 = float(pm25_values[i])
-                        pm25 = max(5.0, min(pm25, 150.0))
+                    supabase_pm25 = city_data[city].get("target_pm25", 0)
+                
+                # Decide which value to use
+                if supabase_pm25 and supabase_pm25 > 0:
+                    # Use Supabase (REAL DATA)
+                    pm25 = supabase_pm25
+                    source = "Supabase"
                 else:
+                    # Fallback to model
                     pm25 = float(pm25_values[i])
                     pm25 = max(5.0, min(pm25, 150.0))
+                    source = "Model"
                 
                 aqi = pm25_to_aqi(pm25)
                 status = aqi_to_category(aqi)
@@ -324,7 +347,8 @@ class ModelManager:
                     "timestamp": datetime.now().isoformat()
                 })
                 
-                logger.info(f"{city}: PM2.5={pm25:.1f}, AQI={aqi:.0f}, Status={status}")
+                # Better logging
+                logger.info(f"  {city:15s}: PM2.5={pm25:6.2f} (source={source:8s}), AQI={aqi:5.1f}, Status={status}")
             
             self.current_predictions_cache = current_results
             
@@ -510,6 +534,26 @@ async def manual_update():
     """Trigger manual update (for testing)"""
     await model_manager.update_all_predictions()
     return {"status": "Update complete", "timestamp": datetime.now().isoformat()}
+
+
+@app.get("/api/debug/supabase")
+async def debug_supabase():
+    """Debug endpoint to see raw Supabase data"""
+    city_data = model_manager.fetch_current_data()
+    
+    result = {}
+    for city, data in city_data.items():
+        result[city] = {
+            "target_pm25_24h": data.get("target_pm25", 0),
+            "temperature": data.get("temperature", 0),
+            "all_fields": data
+        }
+    
+    return {
+        "cities_found": len(result),
+        "data": result,
+        "timestamp": datetime.now().isoformat()
+    }
 
 
 if __name__ == "__main__":
