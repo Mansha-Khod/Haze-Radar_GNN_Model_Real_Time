@@ -241,7 +241,7 @@ class ModelManager:
         try:
             # Fetch last 10 rows per city to ensure we get the most recent
             response = self.supabase.table("gnn_training_data").select(
-                "city," + ",".join(FEATURE_COLS) + ",target_pm25_24h,timestamp"
+                "city," + ",".join(FEATURE_COLS) + ",target_pm25_24h,current_aqi,timestamp"
             ).order("timestamp", desc=True).limit(100).execute()
             
             if not response.data:
@@ -262,11 +262,14 @@ class ModelManager:
                 # Store all features
                 city_data[city] = {col: float(row.get(col, 0)) for col in FEATURE_COLS}
                 
-                # Store target PM2.5
-                target = float(row.get("target_pm25_24h", 0))
-                city_data[city]["target_pm25"] = target
+                # CRITICAL: Store both PM2.5 AND AQI from Supabase
+                target_pm25 = float(row.get("target_pm25_24h", 0))
+                current_aqi = float(row.get("current_aqi", 0))
                 
-                logger.debug(f"  Fetched {city}: target_pm25_24h={target:.2f}, timestamp={row.get('timestamp')}")
+                city_data[city]["target_pm25"] = target_pm25
+                city_data[city]["current_aqi"] = current_aqi
+                
+                logger.debug(f"  Fetched {city}: PM2.5={target_pm25:.2f}, AQI={current_aqi:.1f}, timestamp={row.get('timestamp')}")
             
             logger.info(f"Fetched data for {len(city_data)} cities from Supabase")
             return city_data
@@ -359,13 +362,13 @@ class ModelManager:
             for city in self.cities:
                 weather_forecast = self.weather_cache.get(city, [])
                 
-                # Get base PM2.5 from the FINALIZED current prediction (not raw model output)
+                # Get base values from FINALIZED current prediction
                 current_pred = next((p for p in current_results if p["city"] == city), None)
                 if not current_pred:
                     continue
                 
                 base_pm25 = current_pred["pm25"]
-                base_aqi = current_pred["aqi"]
+                base_aqi = current_pred["aqi"]  # Use the REAL AQI (not recalculated)
                 base_features = city_data.get(city, {col: 0.0 for col in FEATURE_COLS})
                 
                 # Get baseline conditions
@@ -452,7 +455,16 @@ class ModelManager:
                         
                         logger.info(f"    Hour {target_hour}: pm25={pm25:.2f} (factor={combined_factor:.3f})")
                     
-                    aqi = pm25_to_aqi(pm25)
+                    # Calculate AQI proportionally to PM2.5 change (don't use EPA formula)
+                    # This keeps the AQI scale consistent with your data source
+                    if target_hour == 0:
+                        aqi = base_aqi
+                    else:
+                        # Scale AQI proportionally with PM2.5 change
+                        pm25_ratio = pm25 / base_pm25 if base_pm25 > 0 else 1.0
+                        aqi = base_aqi * pm25_ratio
+                        aqi = max(0, min(aqi, 500))  # Keep in valid AQI range
+                    
                     category = aqi_to_category(aqi)
                     
                     logger.info(f"      -> AQI={aqi:.1f}, category={category}")
