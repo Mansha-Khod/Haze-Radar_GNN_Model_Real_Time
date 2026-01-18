@@ -1,15 +1,11 @@
-# main.py
-"""
-Production FastAPI backend for spatiotemporal air quality forecasting
-FIXED: Uses collected AQI from source, scales forecasts proportionally
-"""
-
 import os
 import json
 import logging
+import asyncio
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from collections import defaultdict
+from contextlib import asynccontextmanager
 import aiohttp
 
 import torch
@@ -51,7 +47,6 @@ CITY_COORDINATES = {
 
 
 async def fetch_weather_forecast_batch() -> Dict[str, List[Dict]]:
-    """Fetch weather for ALL cities in one batch"""
     async def fetch_one_city(city: str, coords: Dict) -> tuple:
         url = "https://api.open-meteo.com/v1/forecast"
         params = {
@@ -127,7 +122,6 @@ class HazeForecastGNN(nn.Module):
 
 
 def aqi_to_category(aqi: float) -> str:
-    """Convert AQI to category"""
     try:
         aqi = float(aqi)
         if np.isnan(aqi):
@@ -167,7 +161,6 @@ class ModelManager:
         self.last_update = None
     
     def load_artifacts(self):
-        """Load model and graph structure"""
         logger.info("Loading normalization statistics...")
         with open(NORM_STATS_PATH, 'r') as f:
             norm_stats = json.load(f)
@@ -205,7 +198,6 @@ class ModelManager:
         return (features - self.feature_mean) / self.feature_std
     
     def fetch_current_data(self) -> Dict[str, Dict]:
-        """Fetch latest data from Supabase"""
         if not self.supabase:
             logger.warning("No Supabase client")
             return {}
@@ -241,19 +233,15 @@ class ModelManager:
             return {}
     
     async def update_all_predictions(self):
-        """Main update function - runs on startup and every 6 hours"""
         try:
             logger.info("Starting full prediction update...")
             
-            # 1. Fetch weather for ALL cities in parallel
             logger.info("Fetching weather forecasts...")
             self.weather_cache = await fetch_weather_forecast_batch()
             logger.info(f"Weather cached for {len(self.weather_cache)} cities")
             
-            # 2. Get current Supabase data
             city_data = self.fetch_current_data()
             
-            # 3. Build current predictions - TRUST SUPABASE AQI
             logger.info("Building current predictions...")
             current_results = []
             
@@ -261,7 +249,6 @@ class ModelManager:
                 if city not in city_data:
                     continue
                 
-                # ALWAYS use collected data from WAQI (via your collector)
                 pm25 = city_data[city].get("target_pm25", 0)
                 aqi = city_data[city].get("current_aqi", 0)
                 
@@ -270,11 +257,9 @@ class ModelManager:
                 
                 status = aqi_to_category(aqi)
                 
-                # Get current weather
                 weather_today = self.weather_cache.get(city, [{"temperature": 27.0}])
                 current_temp = weather_today[0]["temperature"] if weather_today else 27.0
                 
-                # Get coordinates
                 coords = CITY_COORDINATES.get(city, {})
                 
                 current_results.append({
@@ -294,7 +279,6 @@ class ModelManager:
             self.current_predictions_cache = current_results
             logger.info("Current predictions complete")
             
-            # 4. Build forecasts - scale AQI proportionally with PM2.5
             logger.info("Building forecasts...")
             for city in self.cities:
                 current_pred = next((p for p in current_results if p["city"] == city), None)
@@ -315,21 +299,17 @@ class ModelManager:
                         weather_at_hour = weather_forecast[target_hour]
                     
                     if target_hour == 0:
-                        # Hour 0 = exactly current data
                         pm25 = base_pm25
                         aqi = base_aqi
                     else:
-                        # Calculate PM2.5 change based on weather
                         temp_now = weather_at_hour.get("temperature", 27.0)
                         wind_now = weather_at_hour.get("wind_speed", 3.5)
                         base_temp = base_features.get("temperature", 27.0)
                         base_wind = base_features.get("wind_speed", 3.5)
                         
-                        # Temperature effect
                         temp_delta = (temp_now - base_temp) / 10.0
                         temp_factor = 1.0 + (temp_delta * 0.05)
                         
-                        # Wind effect
                         if wind_now > base_wind + 2:
                             wind_factor = 0.92
                         elif wind_now > base_wind + 1:
@@ -339,7 +319,6 @@ class ModelManager:
                         else:
                             wind_factor = 1.0
                         
-                        # Fire decay
                         base_fire = base_features.get("upwind_fire_count", 0)
                         if base_fire > 0:
                             fire_decay = max(0.5, 1 - (target_hour / 72.0))
@@ -347,7 +326,6 @@ class ModelManager:
                         else:
                             fire_factor = 1.0
                         
-                        # Diurnal cycle
                         hour_of_day = (datetime.now().hour + target_hour) % 24
                         if 6 <= hour_of_day <= 10:
                             diurnal_factor = 1.05
@@ -358,10 +336,8 @@ class ModelManager:
                         else:
                             diurnal_factor = 1.0
                         
-                        # Combine factors
                         combined_factor = temp_factor * wind_factor * fire_factor * diurnal_factor
                         
-                        # Special damping for first 12 hours
                         if target_hour == 12:
                             combined_factor = max(0.92, min(1.08, combined_factor))
                         else:
@@ -372,12 +348,10 @@ class ModelManager:
                         
                         pm25 = base_pm25 * combined_factor
                         
-                        # Realistic bounds
                         max_deviation = 0.25 * (target_hour / 60.0)
                         pm25 = max(base_pm25 * (1 - max_deviation), min(pm25, base_pm25 * (1 + max_deviation)))
                         pm25 = max(5.0, pm25)
                         
-                        # Scale AQI proportionally (keeps consistency with your data source)
                         pm25_ratio = pm25 / base_pm25 if base_pm25 > 0 else 1.0
                         aqi = base_aqi * pm25_ratio
                         aqi = max(0, min(aqi, 500))
@@ -427,26 +401,12 @@ class ForecastPoint(BaseModel):
     timestamp: str
 
 
-app = FastAPI(
-    title="HazeRadar Inference API",
-    description="GNN-based air quality forecasting - Optimized",
-    version="1.2.0"
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 model_manager = ModelManager()
 scheduler = AsyncIOScheduler()
 
 
-@app.on_event("startup")
-async def startup_event():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     try:
         model_manager.load_artifacts()
         await model_manager.update_all_predictions()
@@ -459,22 +419,37 @@ async def startup_event():
         )
         scheduler.start()
         
-        logger.info("Startup complete - API ready!")
+        logger.info("Startup complete")
     except Exception as e:
         logger.error(f"Startup failed: {e}")
         raise
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
+    
+    yield
+    
     scheduler.shutdown()
+
+
+app = FastAPI(
+    title="HazeRadar Inference API",
+    description="GNN-based air quality forecasting",
+    version="1.2.0",
+    lifespan=lifespan
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/")
 async def root():
     return {
         "status": "healthy",
-        "service": "HazeRadar Inference API (Fixed)",
+        "service": "HazeRadar Inference API",
         "version": "1.2.0",
         "last_update": model_manager.last_update.isoformat() if model_manager.last_update else None
     }
@@ -493,7 +468,6 @@ async def health():
 
 @app.get("/api/predictions/current", response_model=List[CurrentPrediction])
 async def get_current_predictions():
-    """Get current predictions for all cities"""
     if not model_manager.current_predictions_cache:
         raise HTTPException(status_code=503, detail="Predictions not ready yet")
     return model_manager.current_predictions_cache
@@ -501,7 +475,6 @@ async def get_current_predictions():
 
 @app.get("/api/forecast/{city}", response_model=List[ForecastPoint])
 async def get_city_forecast(city: str):
-    """Get hourly forecast for specific city"""
     if not model_manager.forecast_cache:
         raise HTTPException(status_code=503, detail="Forecasts not ready yet")
     
@@ -526,7 +499,6 @@ async def get_cities():
 
 @app.post("/api/update")
 async def manual_update():
-    """Trigger manual update"""
     await model_manager.update_all_predictions()
     return {"status": "Update complete", "timestamp": datetime.now().isoformat()}
 
