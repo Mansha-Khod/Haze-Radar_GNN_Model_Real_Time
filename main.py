@@ -376,7 +376,7 @@ class ModelManager:
                 city_forecasts = []
                 
                 # Log the base values being used
-                logger.debug(f"  {city}: Base PM2.5={base_pm25:.2f}, Base AQI={base_aqi:.1f}")
+                logger.info(f"  Forecast {city}: base_pm25={base_pm25:.2f}, base_aqi={base_aqi:.1f}")
                 
                 for target_hour in FORECAST_HOURS:
                     if target_hour >= len(weather_forecast):
@@ -385,8 +385,9 @@ class ModelManager:
                         weather_at_hour = weather_forecast[target_hour]
                     
                     if target_hour == 0:
-                        # Current conditions
+                        # Current conditions - must exactly match current prediction
                         pm25 = base_pm25
+                        logger.info(f"    Hour {target_hour}: pm25={pm25:.2f} (using base)")
                     else:
                         # Realistic temporal evolution based on environmental factors
                         
@@ -448,14 +449,18 @@ class ModelManager:
                         max_deviation = 0.25 * (target_hour / 60.0)
                         pm25 = max(base_pm25 * (1 - max_deviation), min(pm25, base_pm25 * (1 + max_deviation)))
                         pm25 = max(5.0, pm25)
+                        
+                        logger.info(f"    Hour {target_hour}: pm25={pm25:.2f} (factor={combined_factor:.3f})")
                     
                     aqi = pm25_to_aqi(pm25)
                     category = aqi_to_category(aqi)
                     
+                    logger.info(f"      -> AQI={aqi:.1f}, category={category}")
+                    
                     # Validation: AQI should match PM2.5
                     expected_aqi = pm25_to_aqi(pm25)
                     if abs(aqi - expected_aqi) > 1:
-                        logger.error(f"AQI mismatch for {city} at hour {target_hour}: PM2.5={pm25}, AQI={aqi}, Expected={expected_aqi}")
+                        logger.error(f"      !!! AQI MISMATCH: PM2.5={pm25:.2f} -> calculated AQI={aqi:.1f}, expected={expected_aqi:.1f}")
                     
                     city_forecasts.append({
                         "city": city,
@@ -468,11 +473,8 @@ class ModelManager:
                         "timestamp": (datetime.now() + timedelta(hours=target_hour)).isoformat()
                     })
                 
-                # Log first forecast point for debugging
-                if len(city_forecasts) > 1:
-                    logger.debug(f"    Hour 12: PM2.5={city_forecasts[1]['pm25']}, AQI={city_forecasts[1]['aqi']}")
-                
                 self.forecast_cache[city] = city_forecasts
+                logger.info(f"  Cached {len(city_forecasts)} forecast points for {city}")
             
             self.last_update = datetime.now()
             logger.info(f"Full update complete! Cached {len(self.forecast_cache)} city forecasts")
