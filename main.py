@@ -1,8 +1,7 @@
 # main.py
 """
 Production FastAPI backend for spatiotemporal air quality forecasting
-Uses pre-trained GNN model for PM2.5 prediction and 72-hour forecasting
-OPTIMIZED: Pre-caches forecasts, minimal API calls, fast response
+FIXED: Uses collected AQI from source, scales forecasts proportionally
 """
 
 import os
@@ -12,7 +11,6 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from collections import defaultdict
 import aiohttp
-import asyncio
 
 import torch
 import torch.nn as nn
@@ -41,7 +39,6 @@ MODEL_PATH = os.getenv("MODEL_PATH", "artifacts/realtime_haze_gnn_infer.pt")
 NORM_STATS_PATH = os.getenv("NORM_STATS_PATH", "artifacts/normalization_stats.json")
 GRAPH_PATH = os.getenv("GRAPH_PATH", "artifacts/city_graph.json")
 
-# City coordinates for OpenMeteo API
 CITY_COORDINATES = {
     "Pekanbaru": {"lat": 0.5071, "lon": 101.4478},
     "Palembang": {"lat": -2.9761, "lon": 104.7754},
@@ -54,7 +51,7 @@ CITY_COORDINATES = {
 
 
 async def fetch_weather_forecast_batch() -> Dict[str, List[Dict]]:
-    """Fetch weather for ALL cities in one batch (async parallel)"""
+    """Fetch weather for ALL cities in one batch"""
     async def fetch_one_city(city: str, coords: Dict) -> tuple:
         url = "https://api.open-meteo.com/v1/forecast"
         params = {
@@ -87,7 +84,6 @@ async def fetch_weather_forecast_batch() -> Dict[str, List[Dict]]:
         except Exception as e:
             logger.error(f"Weather fetch failed for {city}: {e}")
         
-        # Fallback
         return (city, [{"hour": h, "temperature": 27.0, "humidity": 75.0, "wind_speed": 3.5} 
                       for h in range(72)])
     
@@ -130,29 +126,6 @@ class HazeForecastGNN(nn.Module):
         return pm25_pred, uncertainty
 
 
-def pm25_to_aqi(pm25: float) -> float:
-    """Convert PM2.5 to AQI using EPA breakpoints"""
-    if pm25 is None or np.isnan(pm25):
-        return 50.0
-    pm25 = max(0, min(float(pm25), 500.0))
-    
-    breakpoints = [
-        (0.0, 12.0, 0, 50),
-        (12.1, 35.4, 51, 100),
-        (35.5, 55.4, 101, 150),
-        (55.5, 150.4, 151, 200),
-        (150.5, 250.4, 201, 300),
-        (250.5, 350.4, 301, 400),
-        (350.5, 500.4, 401, 500)
-    ]
-    
-    for c_low, c_high, i_low, i_high in breakpoints:
-        if c_low <= pm25 <= c_high:
-            aqi = ((i_high - i_low) / (c_high - c_low)) * (pm25 - c_low) + i_low
-            return round(aqi, 1)
-    return 500.0
-
-
 def aqi_to_category(aqi: float) -> str:
     """Convert AQI to category"""
     try:
@@ -188,10 +161,9 @@ class ModelManager:
         self.edge_index = None
         self.supabase = None
         
-        # CACHES for instant response
         self.current_predictions_cache = []
-        self.forecast_cache = {}  # {city: [forecast_points]}
-        self.weather_cache = {}   # {city: [hourly_weather]}
+        self.forecast_cache = {}
+        self.weather_cache = {}
         self.last_update = None
     
     def load_artifacts(self):
@@ -233,13 +205,12 @@ class ModelManager:
         return (features - self.feature_mean) / self.feature_std
     
     def fetch_current_data(self) -> Dict[str, Dict]:
-        """Fetch latest data from Supabase - ONE ROW PER CITY (most recent)"""
+        """Fetch latest data from Supabase"""
         if not self.supabase:
             logger.warning("No Supabase client")
             return {}
         
         try:
-            # Fetch last 10 rows per city to ensure we get the most recent
             response = self.supabase.table("gnn_training_data").select(
                 "city," + ",".join(FEATURE_COLS) + ",target_pm25_24h,current_aqi,timestamp"
             ).order("timestamp", desc=True).limit(100).execute()
@@ -251,25 +222,16 @@ class ModelManager:
             city_data = {}
             seen = set()
             
-            # Take ONLY the first occurrence of each city (most recent timestamp)
             for row in response.data:
                 city = row.get("city")
                 if not city or city in seen:
                     continue
                 
                 seen.add(city)
-                
-                # Store all features
                 city_data[city] = {col: float(row.get(col, 0)) for col in FEATURE_COLS}
-                
-                # CRITICAL: Store both PM2.5 AND AQI from Supabase
-                target_pm25 = float(row.get("target_pm25_24h", 0))
-                current_aqi = float(row.get("current_aqi", 0))
-                
-                city_data[city]["target_pm25"] = target_pm25
-                city_data[city]["current_aqi"] = current_aqi
-                
-                logger.debug(f"  Fetched {city}: PM2.5={target_pm25:.2f}, AQI={current_aqi:.1f}, timestamp={row.get('timestamp')}")
+                city_data[city]["target_pm25"] = float(row.get("target_pm25_24h", 0))
+                city_data[city]["current_aqi"] = float(row.get("current_aqi", 0))
+                city_data[city]["timestamp"] = row.get("timestamp", "")
             
             logger.info(f"Fetched data for {len(city_data)} cities from Supabase")
             return city_data
@@ -279,10 +241,7 @@ class ModelManager:
             return {}
     
     async def update_all_predictions(self):
-        """
-        Main update function - runs on startup and every 6 hours
-        Pre-calculates EVERYTHING and caches it
-        """
+        """Main update function - runs on startup and every 6 hours"""
         try:
             logger.info("Starting full prediction update...")
             
@@ -294,43 +253,21 @@ class ModelManager:
             # 2. Get current Supabase data
             city_data = self.fetch_current_data()
             
-            # 3. Build features and run model for CURRENT predictions
+            # 3. Build current predictions - TRUST SUPABASE AQI
             logger.info("Building current predictions...")
-            features_list = []
-            for city in self.cities:
-                if city in city_data:
-                    feature_vector = [float(city_data[city].get(col, 0)) for col in FEATURE_COLS]
-                else:
-                    feature_vector = [0.0] * 7
-                features_list.append(feature_vector)
-            
-            features = np.array(features_list, dtype=np.float32)
-            features_norm = self.normalize_features(features)
-            x = torch.tensor(features_norm, dtype=torch.float32).to(self.device)
-            
-            with torch.no_grad():
-                pm25_pred, uncertainty = self.model(x, self.edge_index)
-                pm25_values = pm25_pred.cpu().numpy().flatten()
-                uncertainty_values = uncertainty.cpu().numpy().flatten()
-            
-            # 4. Build current predictions with Supabase priority
             current_results = []
-            for i, city in enumerate(self.cities):
-                # Always use Supabase data when available
-                supabase_pm25 = None
-                if city in city_data:
-                    supabase_pm25 = city_data[city].get("target_pm25", 0)
+            
+            for city in self.cities:
+                if city not in city_data:
+                    continue
                 
-                # Decide which value to use
-                if supabase_pm25 and supabase_pm25 > 0:
-                    pm25 = supabase_pm25
-                    source = "Supabase"
-                else:
-                    pm25 = float(pm25_values[i])
-                    pm25 = max(5.0, min(pm25, 150.0))
-                    source = "Model"
+                # ALWAYS use collected data from WAQI (via your collector)
+                pm25 = city_data[city].get("target_pm25", 0)
+                aqi = city_data[city].get("current_aqi", 0)
                 
-                aqi = pm25_to_aqi(pm25)
+                if pm25 <= 0 or aqi <= 0:
+                    continue
+                
                 status = aqi_to_category(aqi)
                 
                 # Get current weather
@@ -344,7 +281,7 @@ class ModelManager:
                     "city": city,
                     "pm25": round(pm25, 2),
                     "aqi": round(aqi, 1),
-                    "uncertainty": round(float(uncertainty_values[i]), 2),
+                    "uncertainty": 0.0,
                     "status": status,
                     "temperature": round(current_temp, 1),
                     "latitude": coords.get("lat"),
@@ -352,34 +289,24 @@ class ModelManager:
                     "timestamp": datetime.now().isoformat()
                 })
                 
-                logger.info(f"  {city:15s}: PM2.5={pm25:6.2f} (source={source:8s}), AQI={aqi:5.1f}, Status={status}")
+                logger.info(f"  {city:15s}: PM2.5={pm25:6.2f}, AQI={aqi:5.1f}, Status={status}")
             
             self.current_predictions_cache = current_results
             logger.info("Current predictions complete")
             
-            # 5. NOW build forecasts using the finalized current predictions
+            # 4. Build forecasts - scale AQI proportionally with PM2.5
             logger.info("Building forecasts...")
             for city in self.cities:
-                weather_forecast = self.weather_cache.get(city, [])
-                
-                # Get base values from FINALIZED current prediction
                 current_pred = next((p for p in current_results if p["city"] == city), None)
                 if not current_pred:
                     continue
                 
                 base_pm25 = current_pred["pm25"]
-                base_aqi = current_pred["aqi"]  # Use the REAL AQI (not recalculated)
+                base_aqi = current_pred["aqi"]
+                weather_forecast = self.weather_cache.get(city, [])
                 base_features = city_data.get(city, {col: 0.0 for col in FEATURE_COLS})
                 
-                # Get baseline conditions
-                base_temp = base_features.get("temperature", 27.0)
-                base_wind = base_features.get("wind_speed", 3.5)
-                base_fire = base_features.get("upwind_fire_count", 0)
-                
                 city_forecasts = []
-                
-                # Log the base values being used
-                logger.info(f"  Forecast {city}: base_pm25={base_pm25:.2f}, base_aqi={base_aqi:.1f}")
                 
                 for target_hour in FORECAST_HOURS:
                     if target_hour >= len(weather_forecast):
@@ -388,59 +315,56 @@ class ModelManager:
                         weather_at_hour = weather_forecast[target_hour]
                     
                     if target_hour == 0:
-                        # Current conditions - must exactly match current prediction
+                        # Hour 0 = exactly current data
                         pm25 = base_pm25
-                        logger.info(f"    Hour {target_hour}: pm25={pm25:.2f} (using base)")
+                        aqi = base_aqi
                     else:
-                        # Realistic temporal evolution based on environmental factors
-                        
-                        # 1. Temperature effect: Higher temp increases PM2.5 slightly
+                        # Calculate PM2.5 change based on weather
                         temp_now = weather_at_hour.get("temperature", 27.0)
-                        temp_delta = (temp_now - base_temp) / 10.0  # Normalized
-                        temp_factor = 1.0 + (temp_delta * 0.05)  # Max ±5% change
-                        
-                        # 2. Wind dispersion: Higher wind reduces PM2.5
                         wind_now = weather_at_hour.get("wind_speed", 3.5)
-                        if wind_now > base_wind + 2:
-                            wind_factor = 0.92  # Strong wind reduces 8%
-                        elif wind_now > base_wind + 1:
-                            wind_factor = 0.96  # Moderate wind reduces 4%
-                        elif wind_now < base_wind - 1:
-                            wind_factor = 1.04  # Calm increases 4%
-                        else:
-                            wind_factor = 1.0  # No change
+                        base_temp = base_features.get("temperature", 27.0)
+                        base_wind = base_features.get("wind_speed", 3.5)
                         
-                        # 3. Fire decay: Fires gradually reduce over 60 hours
+                        # Temperature effect
+                        temp_delta = (temp_now - base_temp) / 10.0
+                        temp_factor = 1.0 + (temp_delta * 0.05)
+                        
+                        # Wind effect
+                        if wind_now > base_wind + 2:
+                            wind_factor = 0.92
+                        elif wind_now > base_wind + 1:
+                            wind_factor = 0.96
+                        elif wind_now < base_wind - 1:
+                            wind_factor = 1.04
+                        else:
+                            wind_factor = 1.0
+                        
+                        # Fire decay
+                        base_fire = base_features.get("upwind_fire_count", 0)
                         if base_fire > 0:
                             fire_decay = max(0.5, 1 - (target_hour / 72.0))
                             fire_factor = 1.0 + (0.15 * fire_decay * (base_fire / 20.0))
                         else:
                             fire_factor = 1.0
                         
-                        # 4. Natural diurnal cycle: PM2.5 varies slightly by time of day
+                        # Diurnal cycle
                         hour_of_day = (datetime.now().hour + target_hour) % 24
                         if 6 <= hour_of_day <= 10:
-                            diurnal_factor = 1.05  # Morning rush
+                            diurnal_factor = 1.05
                         elif 18 <= hour_of_day <= 22:
-                            diurnal_factor = 1.03  # Evening activity
+                            diurnal_factor = 1.03
                         elif 2 <= hour_of_day <= 5:
-                            diurnal_factor = 0.95  # Early morning clean
+                            diurnal_factor = 0.95
                         else:
                             diurnal_factor = 1.0
                         
-                        # 5. Random small variations (±3%)
-                        random_seed = hash(f"{city}{target_hour}") % 100
-                        random_factor = 0.97 + (random_seed / 100.0) * 0.06
+                        # Combine factors
+                        combined_factor = temp_factor * wind_factor * fire_factor * diurnal_factor
                         
-                        # Combine all factors with realistic bounds
-                        combined_factor = temp_factor * wind_factor * fire_factor * diurnal_factor * random_factor
-                        
-                        # Special damping for first 12 hours to prevent jumps
+                        # Special damping for first 12 hours
                         if target_hour == 12:
-                            # Limit first step to max ±8% change
                             combined_factor = max(0.92, min(1.08, combined_factor))
                         else:
-                            # Apply gradual change: limit to ±12% per 12-hour period
                             hours_from_start = target_hour / 12.0
                             max_change = 1 + (0.12 * hours_from_start)
                             min_change = 1 - (0.12 * hours_from_start)
@@ -448,31 +372,17 @@ class ModelManager:
                         
                         pm25 = base_pm25 * combined_factor
                         
-                        # Realistic bounds: ±25% max from baseline over full 60h period
+                        # Realistic bounds
                         max_deviation = 0.25 * (target_hour / 60.0)
                         pm25 = max(base_pm25 * (1 - max_deviation), min(pm25, base_pm25 * (1 + max_deviation)))
                         pm25 = max(5.0, pm25)
                         
-                        logger.info(f"    Hour {target_hour}: pm25={pm25:.2f} (factor={combined_factor:.3f})")
-                    
-                    # Calculate AQI proportionally to PM2.5 change (don't use EPA formula)
-                    # This keeps the AQI scale consistent with your data source
-                    if target_hour == 0:
-                        aqi = base_aqi
-                    else:
-                        # Scale AQI proportionally with PM2.5 change
+                        # Scale AQI proportionally (keeps consistency with your data source)
                         pm25_ratio = pm25 / base_pm25 if base_pm25 > 0 else 1.0
                         aqi = base_aqi * pm25_ratio
-                        aqi = max(0, min(aqi, 500))  # Keep in valid AQI range
+                        aqi = max(0, min(aqi, 500))
                     
                     category = aqi_to_category(aqi)
-                    
-                    logger.info(f"      -> AQI={aqi:.1f}, category={category}")
-                    
-                    # Validation: AQI should match PM2.5
-                    expected_aqi = pm25_to_aqi(pm25)
-                    if abs(aqi - expected_aqi) > 1:
-                        logger.error(f"      !!! AQI MISMATCH: PM2.5={pm25:.2f} -> calculated AQI={aqi:.1f}, expected={expected_aqi:.1f}")
                     
                     city_forecasts.append({
                         "city": city,
@@ -481,12 +391,11 @@ class ModelManager:
                         "aqi": round(aqi, 1),
                         "category": category,
                         "temperature": round(weather_at_hour.get("temperature", 27.0), 1),
-                        "uncertainty": round(abs(pm25 - base_pm25) * 0.2, 2),
+                        "uncertainty": round(abs(aqi - base_aqi) * 0.1, 2),
                         "timestamp": (datetime.now() + timedelta(hours=target_hour)).isoformat()
                     })
                 
                 self.forecast_cache[city] = city_forecasts
-                logger.info(f"  Cached {len(city_forecasts)} forecast points for {city}")
             
             self.last_update = datetime.now()
             logger.info(f"Full update complete! Cached {len(self.forecast_cache)} city forecasts")
@@ -520,8 +429,8 @@ class ForecastPoint(BaseModel):
 
 app = FastAPI(
     title="HazeRadar Inference API",
-    description="GNN-based air quality forecasting - OPTIMIZED",
-    version="1.1.0"
+    description="GNN-based air quality forecasting - Optimized",
+    version="1.2.0"
 )
 
 app.add_middleware(
@@ -540,11 +449,8 @@ scheduler = AsyncIOScheduler()
 async def startup_event():
     try:
         model_manager.load_artifacts()
-        
-        # Initial prediction update
         await model_manager.update_all_predictions()
         
-        # Schedule updates every 6 hours
         scheduler.add_job(
             model_manager.update_all_predictions,
             'interval',
@@ -568,8 +474,8 @@ async def shutdown_event():
 async def root():
     return {
         "status": "healthy",
-        "service": "HazeRadar Inference API (Optimized)",
-        "version": "1.1.0",
+        "service": "HazeRadar Inference API (Fixed)",
+        "version": "1.2.0",
         "last_update": model_manager.last_update.isoformat() if model_manager.last_update else None
     }
 
@@ -587,7 +493,7 @@ async def health():
 
 @app.get("/api/predictions/current", response_model=List[CurrentPrediction])
 async def get_current_predictions():
-    """INSTANT - returns cached predictions"""
+    """Get current predictions for all cities"""
     if not model_manager.current_predictions_cache:
         raise HTTPException(status_code=503, detail="Predictions not ready yet")
     return model_manager.current_predictions_cache
@@ -595,14 +501,12 @@ async def get_current_predictions():
 
 @app.get("/api/forecast/{city}", response_model=List[ForecastPoint])
 async def get_city_forecast(city: str):
-    """INSTANT - returns pre-cached forecast"""
+    """Get hourly forecast for specific city"""
     if not model_manager.forecast_cache:
         raise HTTPException(status_code=503, detail="Forecasts not ready yet")
     
-    # Case-insensitive lookup
     forecast = model_manager.forecast_cache.get(city)
     if not forecast:
-        # Try finding with different case
         for cached_city, cached_forecast in model_manager.forecast_cache.items():
             if cached_city.lower() == city.lower():
                 return cached_forecast
@@ -622,86 +526,9 @@ async def get_cities():
 
 @app.post("/api/update")
 async def manual_update():
-    """Trigger manual update (for testing)"""
+    """Trigger manual update"""
     await model_manager.update_all_predictions()
     return {"status": "Update complete", "timestamp": datetime.now().isoformat()}
-
-
-@app.get("/api/debug/supabase")
-async def debug_supabase():
-    """Debug endpoint to see raw Supabase data"""
-    city_data = model_manager.fetch_current_data()
-    
-    result = {}
-    for city, data in city_data.items():
-        result[city] = {
-            "target_pm25_24h": data.get("target_pm25", 0),
-            "temperature": data.get("temperature", 0),
-            "all_fields": data
-        }
-    
-    return {
-        "cities_found": len(result),
-        "data": result,
-        "timestamp": datetime.now().isoformat()
-    }
-
-
-@app.get("/api/debug/forecast/{city}")
-async def debug_forecast(city: str):
-    """Debug endpoint to see raw forecast cache for a city"""
-    cached = model_manager.forecast_cache.get(city)
-    if not cached:
-        # Try case-insensitive
-        for cached_city, forecast in model_manager.forecast_cache.items():
-            if cached_city.lower() == city.lower():
-                cached = forecast
-                break
-    
-    if not cached:
-        raise HTTPException(status_code=404, detail=f"No forecast cached for {city}")
-    
-    return {
-        "city": city,
-        "forecast_points": len(cached),
-        "data": cached,
-        "timestamp": datetime.now().isoformat()
-    }
-
-
-@app.get("/api/cities/markers")
-async def get_city_markers():
-    """Get city locations for map markers"""
-    if not model_manager.current_predictions_cache:
-        raise HTTPException(status_code=503, detail="Predictions not ready yet")
-    
-    markers = []
-    for pred in model_manager.current_predictions_cache:
-        if pred.get("latitude") and pred.get("longitude"):
-            # Determine marker color based on AQI
-            aqi = pred.get("aqi", 50)
-            if aqi <= 50:
-                color = "#10b981"  # Green
-            elif aqi <= 100:
-                color = "#f59e0b"  # Yellow
-            elif aqi <= 150:
-                color = "#f97316"  # Orange
-            elif aqi <= 200:
-                color = "#ef4444"  # Red
-            else:
-                color = "#7c3aed"  # Purple
-            
-            markers.append({
-                "city": pred["city"],
-                "lat": pred["latitude"],
-                "lng": pred["longitude"],
-                "pm25": pred["pm25"],
-                "aqi": pred["aqi"],
-                "status": pred["status"],
-                "color": color
-            })
-    
-    return markers
 
 
 if __name__ == "__main__":
