@@ -292,6 +292,7 @@ class ModelManager:
             city_data = self.fetch_current_data()
             
             # 3. Build features and run model for CURRENT predictions
+            logger.info("Building current predictions...")
             features_list = []
             for city in self.cities:
                 if city in city_data:
@@ -309,8 +310,7 @@ class ModelManager:
                 pm25_values = pm25_pred.cpu().numpy().flatten()
                 uncertainty_values = uncertainty.cpu().numpy().flatten()
             
-            # 4. Build current predictions
-            logger.info("Building current predictions...")
+            # 4. Build current predictions with Supabase priority
             current_results = []
             for i, city in enumerate(self.cities):
                 # Always use Supabase data when available
@@ -352,9 +352,9 @@ class ModelManager:
                 logger.info(f"  {city:15s}: PM2.5={pm25:6.2f} (source={source:8s}), AQI={aqi:5.1f}, Status={status}")
             
             self.current_predictions_cache = current_results
+            logger.info("Current predictions complete")
             
-            # 5. Build forecasts for each city using realistic temporal patterns
-            # IMPORTANT: Build forecasts AFTER current_results so we use correct base values
+            # 5. NOW build forecasts using the finalized current predictions
             logger.info("Building forecasts...")
             for city in self.cities:
                 weather_forecast = self.weather_cache.get(city, [])
