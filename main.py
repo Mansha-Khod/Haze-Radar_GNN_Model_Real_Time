@@ -354,13 +354,18 @@ class ModelManager:
             self.current_predictions_cache = current_results
             
             # 5. Build forecasts for each city using realistic temporal patterns
+            # IMPORTANT: Build forecasts AFTER current_results so we use correct base values
             logger.info("Building forecasts...")
             for city in self.cities:
                 weather_forecast = self.weather_cache.get(city, [])
                 
-                # Get base PM2.5 from current prediction
-                base_pm25 = next((p["pm25"] for p in current_results if p["city"] == city), 40.0)
-                base_aqi = pm25_to_aqi(base_pm25)
+                # Get base PM2.5 from the FINALIZED current prediction (not raw model output)
+                current_pred = next((p for p in current_results if p["city"] == city), None)
+                if not current_pred:
+                    continue
+                
+                base_pm25 = current_pred["pm25"]
+                base_aqi = current_pred["aqi"]
                 base_features = city_data.get(city, {col: 0.0 for col in FEATURE_COLS})
                 
                 # Get baseline conditions
@@ -369,6 +374,9 @@ class ModelManager:
                 base_fire = base_features.get("upwind_fire_count", 0)
                 
                 city_forecasts = []
+                
+                # Log the base values being used
+                logger.debug(f"  {city}: Base PM2.5={base_pm25:.2f}, Base AQI={base_aqi:.1f}")
                 
                 for target_hour in FORECAST_HOURS:
                     if target_hour >= len(weather_forecast):
@@ -444,6 +452,11 @@ class ModelManager:
                     aqi = pm25_to_aqi(pm25)
                     category = aqi_to_category(aqi)
                     
+                    # Validation: AQI should match PM2.5
+                    expected_aqi = pm25_to_aqi(pm25)
+                    if abs(aqi - expected_aqi) > 1:
+                        logger.error(f"AQI mismatch for {city} at hour {target_hour}: PM2.5={pm25}, AQI={aqi}, Expected={expected_aqi}")
+                    
                     city_forecasts.append({
                         "city": city,
                         "hour": target_hour,
@@ -454,6 +467,10 @@ class ModelManager:
                         "uncertainty": round(abs(pm25 - base_pm25) * 0.2, 2),
                         "timestamp": (datetime.now() + timedelta(hours=target_hour)).isoformat()
                     })
+                
+                # Log first forecast point for debugging
+                if len(city_forecasts) > 1:
+                    logger.debug(f"    Hour 12: PM2.5={city_forecasts[1]['pm25']}, AQI={city_forecasts[1]['aqi']}")
                 
                 self.forecast_cache[city] = city_forecasts
             
@@ -612,6 +629,28 @@ async def debug_supabase():
     return {
         "cities_found": len(result),
         "data": result,
+        "timestamp": datetime.now().isoformat()
+    }
+
+
+@app.get("/api/debug/forecast/{city}")
+async def debug_forecast(city: str):
+    """Debug endpoint to see raw forecast cache for a city"""
+    cached = model_manager.forecast_cache.get(city)
+    if not cached:
+        # Try case-insensitive
+        for cached_city, forecast in model_manager.forecast_cache.items():
+            if cached_city.lower() == city.lower():
+                cached = forecast
+                break
+    
+    if not cached:
+        raise HTTPException(status_code=404, detail=f"No forecast cached for {city}")
+    
+    return {
+        "city": city,
+        "forecast_points": len(cached),
+        "data": cached,
         "timestamp": datetime.now().isoformat()
     }
 
