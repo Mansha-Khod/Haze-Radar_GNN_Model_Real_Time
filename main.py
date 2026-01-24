@@ -36,13 +36,16 @@ NORM_STATS_PATH = os.getenv("NORM_STATS_PATH", "artifacts/normalization_stats.js
 GRAPH_PATH = os.getenv("GRAPH_PATH", "artifacts/city_graph.json")
 
 CITY_COORDINATES = {
-    "Pekanbaru": {"lat": 0.5071, "lon": 101.4478},
-    "Palembang": {"lat": -2.9761, "lon": 104.7754},
-    "Jambi": {"lat": -1.6101, "lon": 103.6131},
-    "Pontianak": {"lat": -0.0263, "lon": 109.3425},
-    "Palangkaraya": {"lat": -2.2089, "lon": 113.9213},
-    "Sampit": {"lat": -2.5333, "lon": 112.95},
-    "Pangkalan Bun": {"lat": -2.6833, "lon": 111.6167}
+    "Bekasi": {"lat": -6.2383, "lon": 106.9756},
+    "Karawang": {"lat": -6.3063, "lon": 107.3019},
+    "Sumedang": {"lat": -6.8575, "lon": 107.9167},
+    "Tasikmalaya": {"lat": -7.3274, "lon": 108.2207},
+    "Bandung": {"lat": -6.9175, "lon": 107.6191},
+    "Subang": {"lat": -6.5697, "lon": 107.7631},
+    "Indramayu": {"lat": -6.3269, "lon": 108.3200},
+    "Cimahi": {"lat": -6.8722, "lon": 107.5425},
+    "West Bandung": {"lat": -6.8597, "lon": 107.4858},
+    "Cianjur": {"lat": -6.8167, "lon": 107.1392}
 }
 
 
@@ -71,15 +74,15 @@ async def fetch_weather_forecast_batch() -> Dict[str, List[Dict]]:
                         for h in range(min(72, len(temps))):
                             forecasts.append({
                                 "hour": h,
-                                "temperature": temps[h] if h < len(temps) else 27.0,
-                                "humidity": humidity[h] if h < len(humidity) else 75.0,
-                                "wind_speed": wind[h] if h < len(wind) else 3.5
+                                "temperature": temps[h] if h < len(temps) else 26.0,
+                                "humidity": humidity[h] if h < len(humidity) else 80.0,
+                                "wind_speed": wind[h] if h < len(wind) else 3.0
                             })
                         return (city, forecasts)
         except Exception as e:
             logger.error(f"Weather fetch failed for {city}: {e}")
         
-        return (city, [{"hour": h, "temperature": 27.0, "humidity": 75.0, "wind_speed": 3.5} 
+        return (city, [{"hour": h, "temperature": 26.0, "humidity": 80.0, "wind_speed": 3.0} 
                       for h in range(72)])
     
     tasks = [fetch_one_city(city, coords) for city, coords in CITY_COORDINATES.items()]
@@ -204,8 +207,8 @@ class ModelManager:
         
         try:
             response = self.supabase.table("gnn_training_data").select(
-                "city," + ",".join(FEATURE_COLS) + ",target_pm25_24h,current_aqi,timestamp"
-            ).order("timestamp", desc=True).limit(100).execute()
+                "city," + ",".join(FEATURE_COLS) + ",current_pm25,current_aqi,created_at"
+            ).order("created_at", desc=True).limit(100).execute()
             
             if not response.data:
                 logger.warning("No data returned from Supabase")
@@ -221,9 +224,9 @@ class ModelManager:
                 
                 seen.add(city)
                 city_data[city] = {col: float(row.get(col, 0)) for col in FEATURE_COLS}
-                city_data[city]["target_pm25"] = float(row.get("target_pm25_24h", 0))
+                city_data[city]["current_pm25"] = float(row.get("current_pm25", 0))
                 city_data[city]["current_aqi"] = float(row.get("current_aqi", 0))
-                city_data[city]["timestamp"] = row.get("timestamp", "")
+                city_data[city]["timestamp"] = row.get("created_at", "")
             
             logger.info(f"Fetched data for {len(city_data)} cities from Supabase")
             return city_data
@@ -249,7 +252,7 @@ class ModelManager:
                 if city not in city_data:
                     continue
                 
-                pm25 = city_data[city].get("target_pm25", 0)
+                pm25 = city_data[city].get("current_pm25", 0)
                 aqi = city_data[city].get("current_aqi", 0)
                 
                 if pm25 <= 0 or aqi <= 0:
@@ -257,8 +260,8 @@ class ModelManager:
                 
                 status = aqi_to_category(aqi)
                 
-                weather_today = self.weather_cache.get(city, [{"temperature": 27.0}])
-                current_temp = weather_today[0]["temperature"] if weather_today else 27.0
+                weather_today = self.weather_cache.get(city, [{"temperature": 26.0}])
+                current_temp = weather_today[0]["temperature"] if weather_today else 26.0
                 
                 coords = CITY_COORDINATES.get(city, {})
                 
@@ -294,7 +297,7 @@ class ModelManager:
                 
                 for target_hour in FORECAST_HOURS:
                     if target_hour >= len(weather_forecast):
-                        weather_at_hour = {"temperature": 27.0, "humidity": 75.0, "wind_speed": 3.5}
+                        weather_at_hour = {"temperature": 26.0, "humidity": 80.0, "wind_speed": 3.0}
                     else:
                         weather_at_hour = weather_forecast[target_hour]
                     
@@ -302,10 +305,10 @@ class ModelManager:
                         pm25 = base_pm25
                         aqi = base_aqi
                     else:
-                        temp_now = weather_at_hour.get("temperature", 27.0)
-                        wind_now = weather_at_hour.get("wind_speed", 3.5)
-                        base_temp = base_features.get("temperature", 27.0)
-                        base_wind = base_features.get("wind_speed", 3.5)
+                        temp_now = weather_at_hour.get("temperature", 26.0)
+                        wind_now = weather_at_hour.get("wind_speed", 3.0)
+                        base_temp = base_features.get("temperature", 26.0)
+                        base_wind = base_features.get("wind_speed", 3.0)
                         
                         temp_delta = (temp_now - base_temp) / 10.0
                         temp_factor = 1.0 + (temp_delta * 0.05)
@@ -364,7 +367,7 @@ class ModelManager:
                         "pm25": round(pm25, 2),
                         "aqi": round(aqi, 1),
                         "category": category,
-                        "temperature": round(weather_at_hour.get("temperature", 27.0), 1),
+                        "temperature": round(weather_at_hour.get("temperature", 26.0), 1),
                         "uncertainty": round(abs(aqi - base_aqi) * 0.1, 2),
                         "timestamp": (datetime.now() + timedelta(hours=target_hour)).isoformat()
                     })
@@ -431,8 +434,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="HazeRadar Inference API",
-    description="GNN-based air quality forecasting",
-    version="1.2.0",
+    description="GNN-based air quality forecasting for West Java",
+    version="2.0.0",
     lifespan=lifespan
 )
 
@@ -450,7 +453,8 @@ async def root():
     return {
         "status": "healthy",
         "service": "HazeRadar Inference API",
-        "version": "1.2.0",
+        "version": "2.0.0",
+        "region": "West Java, Indonesia",
         "last_update": model_manager.last_update.isoformat() if model_manager.last_update else None
     }
 
