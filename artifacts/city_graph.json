@@ -1,7 +1,51 @@
 {
+  "city_to_idx": {
+    "Bekasi": 0,
+    "Karawang": 1,
+    "Sumedang": 2,
+    "Tasikmalaya": 3,
+    "Bandung": 4,
+    "Subang": 5,
+    "Indramayu": 6,
+    "Cimahi": 7,
+    "West Bandung": 8,
+    "Cianjur": 9
+  },
   "edges": [
     [
       0,
+      1
+    ],
+    [
+      0,
+      2
+    ],
+    [
+      0,
+      4
+    ],
+    [
+      0,
+      5
+    ],
+    [
+      0,
+      6
+    ],
+    [
+      0,
+      7
+    ],
+    [
+      0,
+      8
+    ],
+    [
+      0,
+      9
+    ],
+    [
+      1,
       0
     ],
     [
@@ -10,7 +54,31 @@
     ],
     [
       1,
-      3
+      4
+    ],
+    [
+      1,
+      5
+    ],
+    [
+      1,
+      6
+    ],
+    [
+      1,
+      7
+    ],
+    [
+      1,
+      8
+    ],
+    [
+      1,
+      9
+    ],
+    [
+      2,
+      0
     ],
     [
       2,
@@ -21,70 +89,324 @@
       3
     ],
     [
-      3,
-      1
+      2,
+      4
+    ],
+    [
+      2,
+      5
+    ],
+    [
+      2,
+      6
+    ],
+    [
+      2,
+      7
+    ],
+    [
+      2,
+      8
+    ],
+    [
+      2,
+      9
     ],
     [
       3,
       2
     ],
     [
+      3,
+      4
+    ],
+    [
+      3,
+      5
+    ],
+    [
+      3,
+      6
+    ],
+    [
+      3,
+      7
+    ],
+    [
+      3,
+      8
+    ],
+    [
+      3,
+      9
+    ],
+    [
+      4,
+      0
+    ],
+    [
+      4,
+      1
+    ],
+    [
+      4,
+      2
+    ],
+    [
+      4,
+      3
+    ],
+    [
+      4,
+      5
+    ],
+    [
       4,
       6
     ],
     [
+      4,
+      7
+    ],
+    [
+      4,
+      8
+    ],
+    [
+      4,
+      9
+    ],
+    [
       5,
-      5
+      0
+    ],
+    [
+      5,
+      1
+    ],
+    [
+      5,
+      2
+    ],
+    [
+      5,
+      3
+    ],
+    [
+      5,
+      4
+    ],
+    [
+      5,
+      6
+    ],
+    [
+      5,
+      7
+    ],
+    [
+      5,
+      8
+    ],
+    [
+      5,
+      9
+    ],
+    [
+      6,
+      0
+    ],
+    [
+      6,
+      1
+    ],
+    [
+      6,
+      2
+    ],
+    [
+      6,
+      3
     ],
     [
       6,
       4
+    ],
+    [
+      6,
+      5
+    ],
+    [
+      6,
+      7
+    ],
+    [
+      6,
+      8
+    ],
+    [
+      6,
+      9
+    ],
+    [
+      7,
+      0
+    ],
+    [
+      7,
+      1
+    ],
+    [
+      7,
+      2
+    ],
+    [
+      7,
+      3
+    ],
+    [
+      7,
+      4
+    ],
+    [
+      7,
+      5
+    ],
+    [
+      7,
+      6
+    ],
+    [
+      7,
+      8
+    ],
+    [
+      7,
+      9
+    ],
+    [
+      8,
+      0
+    ],
+    [
+      8,
+      1
+    ],
+    [
+      8,
+      2
+    ],
+    [
+      8,
+      3
+    ],
+    [
+      8,
+      4
+    ],
+    [
+      8,
+      5
+    ],
+    [
+      8,
+      6
+    ],
+    [
+      8,
+      7
+    ],
+    [
+      8,
+      9
+    ],
+    [
+      9,
+      0
+    ],
+    [
+      9,
+      1
+    ],
+    [
+      9,
+      2
+    ],
+    [
+      9,
+      3
+    ],
+    [
+      9,
+      4
+    ],
+    [
+      9,
+      5
+    ],
+    [
+      9,
+      6
+    ],
+    [
+      9,
+      7
+    ],
+    [
+      9,
+      8
     ]
   ],
-  "city_to_idx": {
-    "Pekanbaru": 0,
-    "Palangkaraya": 1,
-    "Sampit": 2,
-    "Pangkalan Bun": 3,
-    "Palembang": 4,
-    "Pontianak": 5,
-    "Jambi": 6
-  },
   "cities": [
     {
-      "city": "Pekanbaru",
-      "latitude": 0.5071,
-      "longitude": 101.4478
+      "city": "Bekasi",
+      "latitude": -6.2383,
+      "longitude": 106.9756
     },
     {
-      "city": "Palangkaraya",
-      "latitude": -2.2086,
-      "longitude": 113.9167
+      "city": "Karawang",
+      "latitude": -6.3063,
+      "longitude": 107.3019
     },
     {
-      "city": "Sampit",
-      "latitude": -2.5333,
-      "longitude": 112.95
+      "city": "Sumedang",
+      "latitude": -6.8575,
+      "longitude": 107.9167
     },
     {
-      "city": "Pangkalan Bun",
-      "latitude": -2.6833,
-      "longitude": 111.6167
+      "city": "Tasikmalaya",
+      "latitude": -7.3274,
+      "longitude": 108.2207
     },
     {
-      "city": "Palembang",
-      "latitude": -2.991,
-      "longitude": 104.7574
+      "city": "Bandung",
+      "latitude": -6.9175,
+      "longitude": 107.6191
     },
     {
-      "city": "Pontianak",
-      "latitude": -0.0226,
-      "longitude": 109.3425
+      "city": "Subang",
+      "latitude": -6.5697,
+      "longitude": 107.7631
     },
     {
-      "city": "Jambi",
-      "latitude": -1.61,
-      "longitude": 103.6072
+      "city": "Indramayu",
+      "latitude": -6.3269,
+      "longitude": 108.32
+    },
+    {
+      "city": "Cimahi",
+      "latitude": -6.8722,
+      "longitude": 107.5425
+    },
+    {
+      "city": "West Bandung",
+      "latitude": -6.8597,
+      "longitude": 107.4858
+    },
+    {
+      "city": "Cianjur",
+      "latitude": -6.8167,
+      "longitude": 107.1392
     }
   ]
 }
