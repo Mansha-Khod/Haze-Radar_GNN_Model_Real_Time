@@ -1,6 +1,6 @@
 {
   "model": "GATv2 PM2.5 Forecasting GNN - West Java",
-  "training_date": "2026-01-24",
+  "training_date": "2026-01-30",
   "features": [
     "temperature",
     "humidity",
@@ -10,10 +10,11 @@
     "upwind_fire_count",
     "population_density"
   ],
-  "target": "current_pm25",
+  "target": "PM2.5 6 hours ahead",
   "num_cities": 10,
   "max_edge_distance_km": 150,
   "normalization": "z-score (mean/std)",
   "loss": "MSE + Uncertainty",
-  "notes": "Model predicts current PM2.5 for West Java cities"
+  "prediction_horizon_hours": 6,
+  "notes": "Model predicts FUTURE PM2.5, not current values"
 }
