@@ -27,7 +27,7 @@ FEATURE_COLS = [
     "avg_fire_confidence", "upwind_fire_count", "population_density"
 ]
 
-FORECAST_HOURS = [0, 12, 24, 36, 48, 60]
+FORECAST_HOURS = [0, 6, 12, 18, 24, 30, 36, 42, 48, 54, 60, 66, 72]
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
@@ -49,13 +49,50 @@ CITY_COORDINATES = {
 }
 
 
+def pm25_to_aqi(pm25: float) -> int:
+    """Convert PM2.5 to US AQI"""
+    if pm25 < 0:
+        return 0
+    elif pm25 <= 12.0:
+        return int(pm25 * 50 / 12.0)
+    elif pm25 <= 35.4:
+        return int(50 + (pm25 - 12.0) * 50 / 23.4)
+    elif pm25 <= 55.4:
+        return int(100 + (pm25 - 35.4) * 50 / 20.0)
+    elif pm25 <= 150.4:
+        return int(150 + (pm25 - 55.4) * 100 / 95.0)
+    elif pm25 <= 250.4:
+        return int(200 + (pm25 - 150.4) * 100 / 100.0)
+    elif pm25 <= 350.4:
+        return int(300 + (pm25 - 250.4) * 100 / 100.0)
+    else:
+        return int(400 + (pm25 - 350.4) * 100 / 149.6)
+
+
+def aqi_to_category(aqi: float) -> str:
+    """Convert AQI to health category"""
+    if aqi <= 50:
+        return "Good"
+    elif aqi <= 100:
+        return "Moderate"
+    elif aqi <= 150:
+        return "Unhealthy for Sensitive Groups"
+    elif aqi <= 200:
+        return "Unhealthy"
+    elif aqi <= 300:
+        return "Very Unhealthy"
+    else:
+        return "Hazardous"
+
+
 async def fetch_weather_forecast_batch() -> Dict[str, List[Dict]]:
+    """Fetch 72-hour weather forecasts for all cities"""
     async def fetch_one_city(city: str, coords: Dict) -> tuple:
         url = "https://api.open-meteo.com/v1/forecast"
         params = {
             "latitude": coords["lat"],
             "longitude": coords["lon"],
-            "hourly": "temperature_2m,relative_humidity_2m,wind_speed_10m",
+            "hourly": "temperature_2m,relative_humidity_2m,wind_speed_10m,wind_direction_10m",
             "forecast_days": 3,
             "timezone": "auto"
         }
@@ -68,7 +105,8 @@ async def fetch_weather_forecast_batch() -> Dict[str, List[Dict]]:
                         hourly = data.get("hourly", {})
                         temps = hourly.get("temperature_2m", [])
                         humidity = hourly.get("relative_humidity_2m", [])
-                        wind = hourly.get("wind_speed_10m", [])
+                        wind_speed = hourly.get("wind_speed_10m", [])
+                        wind_dir = hourly.get("wind_direction_10m", [])
                         
                         forecasts = []
                         for h in range(min(72, len(temps))):
@@ -76,14 +114,21 @@ async def fetch_weather_forecast_batch() -> Dict[str, List[Dict]]:
                                 "hour": h,
                                 "temperature": temps[h] if h < len(temps) else 26.0,
                                 "humidity": humidity[h] if h < len(humidity) else 80.0,
-                                "wind_speed": wind[h] if h < len(wind) else 3.0
+                                "wind_speed": wind_speed[h] if h < len(wind_speed) else 3.0,
+                                "wind_direction": wind_dir[h] if h < len(wind_dir) else 180.0
                             })
                         return (city, forecasts)
         except Exception as e:
             logger.error(f"Weather fetch failed for {city}: {e}")
         
-        return (city, [{"hour": h, "temperature": 26.0, "humidity": 80.0, "wind_speed": 3.0} 
-                      for h in range(72)])
+        # Fallback
+        return (city, [{
+            "hour": h, 
+            "temperature": 26.0, 
+            "humidity": 80.0, 
+            "wind_speed": 3.0,
+            "wind_direction": 180.0
+        } for h in range(72)])
     
     tasks = [fetch_one_city(city, coords) for city, coords in CITY_COORDINATES.items()]
     results = await asyncio.gather(*tasks)
@@ -91,6 +136,8 @@ async def fetch_weather_forecast_batch() -> Dict[str, List[Dict]]:
 
 
 class HazeForecastGNN(nn.Module):
+    """Graph Neural Network for PM2.5 forecasting"""
+    
     def __init__(self, in_features: int, hidden_dim: int = 128, 
                  num_heads: int = 4, dropout: float = 0.2):
         super().__init__()
@@ -98,121 +145,104 @@ class HazeForecastGNN(nn.Module):
         self.ln1 = nn.LayerNorm(hidden_dim)
         self.gat2 = GATv2Conv(hidden_dim, hidden_dim // num_heads, heads=num_heads, dropout=dropout)
         self.ln2 = nn.LayerNorm(hidden_dim)
+        
         self.prediction_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim // 2, 1)
         )
+        
         self.uncertainty_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 4),
             nn.ReLU(),
             nn.Linear(hidden_dim // 4, 1),
             nn.Softplus()
         )
+        
         self.dropout = nn.Dropout(dropout)
-    
+
     def forward(self, x, edge_index):
         h = self.gat1(x, edge_index)
         h = F.elu(self.ln1(h))
         h = self.dropout(h)
+        
         h2 = self.gat2(h, edge_index)
         h2 = self.ln2(h2)
         h = F.elu(h + h2)
+        
         pm25_pred = self.prediction_head(h)
         uncertainty = self.uncertainty_head(h)
+        
         return pm25_pred, uncertainty
 
 
-def aqi_to_category(aqi: float) -> str:
-    try:
-        aqi = float(aqi)
-        if np.isnan(aqi):
-            return "Unknown"
-    except (ValueError, TypeError):
-        return "Unknown"
-    
-    if aqi <= 50:
-        return "Good"
-    elif aqi <= 100:
-        return "Moderate"
-    elif aqi <= 150:
-        return "Unhealthy for Sensitive"
-    elif aqi <= 200:
-        return "Unhealthy"
-    elif aqi <= 300:
-        return "Very Unhealthy"
-    else:
-        return "Hazardous"
-
-
 class ModelManager:
+    """Manages GNN model and predictions"""
+    
     def __init__(self):
         self.model = None
-        self.device = torch.device("cpu")
-        self.feature_mean = None
-        self.feature_std = None
-        self.city_to_idx = None
-        self.edges = None
-        self.cities = None
+        self.graph = None
         self.edge_index = None
+        self.city_to_idx = None
+        self.cities = None
+        self.norm_stats = None
+        self.weather_cache = {}
+        self.current_predictions = []
+        self.city_forecasts = {}
         self.supabase = None
         
-        self.current_predictions_cache = []
-        self.forecast_cache = {}
-        self.weather_cache = {}
-        self.last_update = None
-    
-    def load_artifacts(self):
-        logger.info("Loading normalization statistics...")
-        with open(NORM_STATS_PATH, 'r') as f:
-            norm_stats = json.load(f)
+        if SUPABASE_URL and SUPABASE_KEY:
+            self.supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         
-        self.feature_mean = np.array(norm_stats['feature_mean'], dtype=np.float32)
-        self.feature_std = np.array(norm_stats['feature_std'], dtype=np.float32)
-        
+    def load_graph(self):
+        """Load city graph structure"""
         logger.info("Loading graph structure...")
         with open(GRAPH_PATH, 'r') as f:
-            graph_data = json.load(f)
+            self.graph = json.load(f)
         
-        self.city_to_idx = graph_data['city_to_idx']
-        self.edges = graph_data['edges']
+        self.city_to_idx = self.graph["city_to_idx"]
         self.cities = sorted(self.city_to_idx.keys(), key=lambda c: self.city_to_idx[c])
-        self.edge_index = torch.tensor(self.edges, dtype=torch.long).t().contiguous()
         
-        logger.info(f"Graph loaded: {len(self.cities)} cities, {len(self.edges)} edges")
+        edges = self.graph["edges"]
+        self.edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
         
+        logger.info(f"Graph loaded: {len(self.cities)} cities, {len(edges)} edges")
+    
+    def load_model(self):
+        """Load trained GNN model"""
         logger.info("Loading model...")
-        self.model = HazeForecastGNN(in_features=7, hidden_dim=128, num_heads=4, dropout=0.2)
-        state_dict = torch.load(MODEL_PATH, map_location=self.device)
-        self.model.load_state_dict(state_dict)
-        self.model.to(self.device)
-        self.model.eval()
-        logger.info("Model loaded successfully")
         
-        if SUPABASE_URL and SUPABASE_KEY:
-            try:
-                self.supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-                logger.info("Supabase client initialized")
-            except Exception as e:
-                logger.error(f"Supabase init failed: {e}")
+        # Load normalization stats
+        with open(NORM_STATS_PATH, 'r') as f:
+            self.norm_stats = json.load(f)
+        
+        # Initialize model
+        self.model = HazeForecastGNN(
+            in_features=len(FEATURE_COLS),
+            hidden_dim=128,
+            num_heads=4,
+            dropout=0.2
+        )
+        
+        # Load weights
+        state_dict = torch.load(MODEL_PATH, map_location='cpu')
+        self.model.load_state_dict(state_dict)
+        self.model.eval()
+        
+        logger.info("Model loaded successfully")
     
-    def normalize_features(self, features: np.ndarray) -> np.ndarray:
-        return (features - self.feature_mean) / self.feature_std
-    
-    def fetch_current_data(self) -> Dict[str, Dict]:
+    def fetch_current_data(self) -> Dict:
+        """Fetch latest data from Supabase"""
         if not self.supabase:
-            logger.warning("No Supabase client")
             return {}
         
         try:
-            response = self.supabase.table("gnn_training_data").select(
-                "city," + ",".join(FEATURE_COLS) + ",current_pm25,current_aqi,created_at"
-            ).order("created_at", desc=True).limit(100).execute()
-            
-            if not response.data:
-                logger.warning("No data returned from Supabase")
-                return {}
+            response = self.supabase.table("gnn_training_data")\
+                .select("city," + ",".join(FEATURE_COLS + ["current_pm25", "current_aqi", "created_at"]))\
+                .order("created_at", desc=True)\
+                .limit(100)\
+                .execute()
             
             city_data = {}
             seen = set()
@@ -235,162 +265,232 @@ class ModelManager:
             logger.error(f"Supabase fetch failed: {e}")
             return {}
     
+    def build_feature_matrix(self, city_data: Dict, hour_offset: int = 0) -> np.ndarray:
+        """
+        Build feature matrix for all cities at a given time offset.
+        
+        CRITICAL: Does NOT include current PM2.5 as a feature!
+        This prevents the compounding prediction bug.
+        """
+        feature_matrix = np.zeros((len(self.cities), len(FEATURE_COLS)), dtype=np.float32)
+        
+        for i, city in enumerate(self.cities):
+            if city not in city_data:
+                # Use defaults if no data
+                feature_matrix[i] = [26.0, 80.0, 3.0, 180.0, 0.0, 0.0, 5000.0]
+                continue
+            
+            # Get weather forecast for this hour
+            weather_list = self.weather_cache.get(city, [])
+            if hour_offset < len(weather_list):
+                weather = weather_list[hour_offset]
+            else:
+                weather = {"temperature": 26.0, "humidity": 80.0, 
+                          "wind_speed": 3.0, "wind_direction": 180.0}
+            
+            # Build feature vector
+            current_data = city_data[city]
+            
+            feature_matrix[i] = [
+                weather.get("temperature", 26.0),
+                weather.get("humidity", 80.0),
+                weather.get("wind_speed", 3.0),
+                weather.get("wind_direction", 180.0),
+                current_data.get("avg_fire_confidence", 0.0),
+                current_data.get("upwind_fire_count", 0.0),
+                current_data.get("population_density", 5000.0)
+            ]
+        
+        return feature_matrix
+    
+    def normalize_features(self, features: np.ndarray) -> np.ndarray:
+        """Normalize features using saved statistics"""
+        mean = np.array(self.norm_stats["feature_mean"])
+        std = np.array(self.norm_stats["feature_std"])
+        return (features - mean) / std
+    
+    @torch.no_grad()
+    def predict(self, features: np.ndarray) -> tuple:
+        """
+        Run GNN prediction.
+        
+        Returns: (pm25_predictions, uncertainties)
+        """
+        # Normalize features
+        features_norm = self.normalize_features(features)
+        
+        # Convert to tensor
+        x = torch.tensor(features_norm, dtype=torch.float32)
+        
+        # Run model
+        pm25_pred, uncertainty = self.model(x, self.edge_index)
+        
+        # Convert to numpy
+        pm25_pred = pm25_pred.numpy().flatten()
+        uncertainty = uncertainty.numpy().flatten()
+        
+        # Ensure predictions are reasonable
+        pm25_pred = np.clip(pm25_pred, 0, 200)
+        
+        return pm25_pred, uncertainty
+    
     async def update_all_predictions(self):
+        """Update all predictions (called every 6 hours)"""
         try:
             logger.info("Starting full prediction update...")
             
+            # Fetch weather forecasts
             logger.info("Fetching weather forecasts...")
             self.weather_cache = await fetch_weather_forecast_batch()
             logger.info(f"Weather cached for {len(self.weather_cache)} cities")
             
+            # Fetch current data from Supabase
             city_data = self.fetch_current_data()
             
+            # Build current predictions (hour 0)
             logger.info("Building current predictions...")
             current_results = []
             
-            for city in self.cities:
+            # Get features for current time (hour 0)
+            features_now = self.build_feature_matrix(city_data, hour_offset=0)
+            pm25_now, unc_now = self.predict(features_now)
+            
+            for i, city in enumerate(self.cities):
                 if city not in city_data:
                     continue
                 
-                pm25 = city_data[city].get("current_pm25", 0)
-                aqi = city_data[city].get("current_aqi", 0)
+                # Use GNN prediction
+                predicted_pm25 = float(pm25_now[i])
+                uncertainty = float(unc_now[i])
+                predicted_aqi = pm25_to_aqi(predicted_pm25)
+                status = aqi_to_category(predicted_aqi)
                 
-                if pm25 <= 0 or aqi <= 0:
-                    continue
-                
-                status = aqi_to_category(aqi)
-                
-                weather_today = self.weather_cache.get(city, [{"temperature": 26.0}])
-                current_temp = weather_today[0]["temperature"] if weather_today else 26.0
-                
+                weather_now = self.weather_cache.get(city, [{}])[0]
                 coords = CITY_COORDINATES.get(city, {})
                 
                 current_results.append({
                     "city": city,
-                    "pm25": round(pm25, 2),
-                    "aqi": round(aqi, 1),
-                    "uncertainty": 0.0,
+                    "pm25": round(predicted_pm25, 2),
+                    "aqi": round(predicted_aqi, 1),
+                    "uncertainty": round(uncertainty, 2),
                     "status": status,
-                    "temperature": round(current_temp, 1),
+                    "temperature": round(weather_now.get("temperature", 26.0), 1),
                     "latitude": coords.get("lat"),
                     "longitude": coords.get("lon"),
                     "timestamp": datetime.now().isoformat()
                 })
                 
-                logger.info(f"  {city:15s}: PM2.5={pm25:6.2f}, AQI={aqi:5.1f}, Status={status}")
+                logger.info(f"  {city:15s}: PM2.5={predicted_pm25:6.2f}, AQI={predicted_aqi:5.1f}, Status={status}")
             
-            self.current_predictions_cache = current_results
+            self.current_predictions = current_results
             logger.info("Current predictions complete")
             
+            # Build forecasts for each city
             logger.info("Building forecasts...")
+            self.city_forecasts = {}
+            
             for city in self.cities:
-                current_pred = next((p for p in current_results if p["city"] == city), None)
-                if not current_pred:
+                if city not in city_data:
                     continue
                 
-                base_pm25 = current_pred["pm25"]
-                base_aqi = current_pred["aqi"]
-                weather_forecast = self.weather_cache.get(city, [])
-                base_features = city_data.get(city, {col: 0.0 for col in FEATURE_COLS})
+                forecast = []
                 
-                city_forecasts = []
-                
-                for target_hour in FORECAST_HOURS:
-                    if target_hour >= len(weather_forecast):
-                        weather_at_hour = {"temperature": 26.0, "humidity": 80.0, "wind_speed": 3.0}
-                    else:
-                        weather_at_hour = weather_forecast[target_hour]
+                for hour in FORECAST_HOURS:
+                    # Get features for this future hour
+                    features = self.build_feature_matrix(city_data, hour_offset=hour)
+                    pm25_pred, unc_pred = self.predict(features)
                     
-                    if target_hour == 0:
-                        pm25 = base_pm25
-                        aqi = base_aqi
-                    else:
-                        temp_now = weather_at_hour.get("temperature", 26.0)
-                        wind_now = weather_at_hour.get("wind_speed", 3.0)
-                        base_temp = base_features.get("temperature", 26.0)
-                        base_wind = base_features.get("wind_speed", 3.0)
-                        
-                        temp_delta = (temp_now - base_temp) / 10.0
-                        temp_factor = 1.0 + (temp_delta * 0.05)
-                        
-                        if wind_now > base_wind + 2:
-                            wind_factor = 0.92
-                        elif wind_now > base_wind + 1:
-                            wind_factor = 0.96
-                        elif wind_now < base_wind - 1:
-                            wind_factor = 1.04
-                        else:
-                            wind_factor = 1.0
-                        
-                        base_fire = base_features.get("upwind_fire_count", 0)
-                        if base_fire > 0:
-                            fire_decay = max(0.5, 1 - (target_hour / 72.0))
-                            fire_factor = 1.0 + (0.15 * fire_decay * (base_fire / 20.0))
-                        else:
-                            fire_factor = 1.0
-                        
-                        hour_of_day = (datetime.now().hour + target_hour) % 24
-                        if 6 <= hour_of_day <= 10:
-                            diurnal_factor = 1.05
-                        elif 18 <= hour_of_day <= 22:
-                            diurnal_factor = 1.03
-                        elif 2 <= hour_of_day <= 5:
-                            diurnal_factor = 0.95
-                        else:
-                            diurnal_factor = 1.0
-                        
-                        combined_factor = temp_factor * wind_factor * fire_factor * diurnal_factor
-                        
-                        if target_hour == 12:
-                            combined_factor = max(0.92, min(1.08, combined_factor))
-                        else:
-                            hours_from_start = target_hour / 12.0
-                            max_change = 1 + (0.12 * hours_from_start)
-                            min_change = 1 - (0.12 * hours_from_start)
-                            combined_factor = max(min_change, min(max_change, combined_factor))
-                        
-                        pm25 = base_pm25 * combined_factor
-                        
-                        max_deviation = 0.25 * (target_hour / 60.0)
-                        pm25 = max(base_pm25 * (1 - max_deviation), min(pm25, base_pm25 * (1 + max_deviation)))
-                        pm25 = max(5.0, pm25)
-                        
-                        pm25_ratio = pm25 / base_pm25 if base_pm25 > 0 else 1.0
-                        aqi = base_aqi * pm25_ratio
-                        aqi = max(0, min(aqi, 500))
+                    city_idx = self.city_to_idx[city]
+                    pm25 = float(pm25_pred[city_idx])
+                    uncertainty = float(unc_pred[city_idx])
+                    aqi = pm25_to_aqi(pm25)
                     
-                    category = aqi_to_category(aqi)
+                    weather_list = self.weather_cache.get(city, [])
+                    weather = weather_list[hour] if hour < len(weather_list) else {}
                     
-                    city_forecasts.append({
+                    forecast.append({
                         "city": city,
-                        "hour": target_hour,
+                        "hour": hour,
                         "pm25": round(pm25, 2),
                         "aqi": round(aqi, 1),
-                        "category": category,
-                        "temperature": round(weather_at_hour.get("temperature", 26.0), 1),
-                        "uncertainty": round(abs(aqi - base_aqi) * 0.1, 2),
-                        "timestamp": (datetime.now() + timedelta(hours=target_hour)).isoformat()
+                        "category": aqi_to_category(aqi),
+                        "temperature": round(weather.get("temperature", 26.0), 1),
+                        "uncertainty": round(uncertainty, 2),
+                        "timestamp": (datetime.now() + timedelta(hours=hour)).isoformat()
                     })
                 
-                self.forecast_cache[city] = city_forecasts
+                self.city_forecasts[city] = forecast
             
-            self.last_update = datetime.now()
-            logger.info(f"Full update complete! Cached {len(self.forecast_cache)} city forecasts")
+            logger.info(f"Full update complete! Cached {len(self.city_forecasts)} city forecasts")
             
         except Exception as e:
             logger.error(f"Update failed: {e}", exc_info=True)
 
 
-class CurrentPrediction(BaseModel):
+# Global model manager
+model_mgr = ModelManager()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup and shutdown logic"""
+    logger.info("Starting up...")
+    
+    # Load graph and model
+    model_mgr.load_graph()
+    model_mgr.load_model()
+    logger.info("Loading normalization statistics...")
+    
+    # Initial prediction update
+    await model_mgr.update_all_predictions()
+    
+    # Start scheduler (update every 6 hours)
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(
+        model_mgr.update_all_predictions,
+        'interval',
+        hours=6,
+        id='update_predictions'
+    )
+    scheduler.start()
+    logger.info("Starting on port 8080")
+    logger.info("Startup complete")
+    
+    yield
+    
+    # Shutdown
+    scheduler.shutdown()
+    logger.info("Shutdown complete")
+
+
+# FastAPI app
+app = FastAPI(
+    title="HazeRadar GNN Inference API",
+    description="Real-time PM2.5 forecasting for West Java cities",
+    version="2.0",
+    lifespan=lifespan
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# Response models
+class CityPrediction(BaseModel):
     city: str
     pm25: float
     aqi: float
     uncertainty: float
     status: str
     temperature: float
-    timestamp: str
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+    timestamp: str
 
 
 class ForecastPoint(BaseModel):
@@ -404,58 +504,15 @@ class ForecastPoint(BaseModel):
     timestamp: str
 
 
-model_manager = ModelManager()
-scheduler = AsyncIOScheduler()
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    try:
-        model_manager.load_artifacts()
-        await model_manager.update_all_predictions()
-        
-        scheduler.add_job(
-            model_manager.update_all_predictions,
-            'interval',
-            hours=6,
-            id='prediction_updater'
-        )
-        scheduler.start()
-        
-        logger.info("Startup complete")
-    except Exception as e:
-        logger.error(f"Startup failed: {e}")
-        raise
-    
-    yield
-    
-    scheduler.shutdown()
-
-
-app = FastAPI(
-    title="HazeRadar Inference API",
-    description="GNN-based air quality forecasting for West Java",
-    version="2.0.0",
-    lifespan=lifespan
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
+# API endpoints
 @app.get("/")
 async def root():
     return {
-        "status": "healthy",
-        "service": "HazeRadar Inference API",
-        "version": "2.0.0",
-        "region": "West Java, Indonesia",
-        "last_update": model_manager.last_update.isoformat() if model_manager.last_update else None
+        "service": "HazeRadar GNN Inference API",
+        "version": "2.0",
+        "status": "running",
+        "cities": len(model_mgr.cities) if model_mgr.cities else 0,
+        "model_loaded": model_mgr.model is not None
     }
 
 
@@ -463,52 +520,45 @@ async def root():
 async def health():
     return {
         "status": "healthy",
-        "model_loaded": model_manager.model is not None,
-        "cities_count": len(model_manager.cities) if model_manager.cities else 0,
-        "cache_ready": len(model_manager.forecast_cache) > 0,
-        "last_update": model_manager.last_update.isoformat() if model_manager.last_update else None
+        "model_loaded": model_mgr.model is not None,
+        "graph_loaded": model_mgr.graph is not None,
+        "cities": len(model_mgr.cities) if model_mgr.cities else 0,
+        "cached_predictions": len(model_mgr.current_predictions),
+        "cached_forecasts": len(model_mgr.city_forecasts)
     }
-
-
-@app.get("/api/predictions/current", response_model=List[CurrentPrediction])
-async def get_current_predictions():
-    if not model_manager.current_predictions_cache:
-        raise HTTPException(status_code=503, detail="Predictions not ready yet")
-    return model_manager.current_predictions_cache
-
-
-@app.get("/api/forecast/{city}", response_model=List[ForecastPoint])
-async def get_city_forecast(city: str):
-    if not model_manager.forecast_cache:
-        raise HTTPException(status_code=503, detail="Forecasts not ready yet")
-    
-    forecast = model_manager.forecast_cache.get(city)
-    if not forecast:
-        for cached_city, cached_forecast in model_manager.forecast_cache.items():
-            if cached_city.lower() == city.lower():
-                return cached_forecast
-        
-        raise HTTPException(status_code=404, detail=f"City '{city}' not found")
-    
-    return forecast
 
 
 @app.get("/cities")
 async def get_cities():
-    return {
-        "cities": model_manager.cities,
-        "count": len(model_manager.cities)
-    }
+    return {"cities": model_mgr.cities or []}
 
 
-@app.post("/api/update")
-async def manual_update():
-    await model_manager.update_all_predictions()
-    return {"status": "Update complete", "timestamp": datetime.now().isoformat()}
+@app.get("/api/predictions/current", response_model=List[CityPrediction])
+async def get_current_predictions():
+    """Get current PM2.5 predictions for all cities"""
+    if not model_mgr.current_predictions:
+        raise HTTPException(status_code=503, detail="Predictions not yet available")
+    
+    return model_mgr.current_predictions
+
+
+@app.get("/api/forecast/{city}", response_model=List[ForecastPoint])
+async def get_city_forecast(city: str):
+    """Get 72-hour forecast for a specific city"""
+    if city not in model_mgr.city_forecasts:
+        raise HTTPException(status_code=404, detail=f"No forecast for city: {city}")
+    
+    return model_mgr.city_forecasts[city]
+
+
+@app.post("/api/refresh")
+async def refresh_predictions():
+    """Manually trigger prediction refresh"""
+    await model_mgr.update_all_predictions()
+    return {"status": "refreshed", "timestamp": datetime.now().isoformat()}
 
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    logger.info(f"Starting on port {port}")
+    port = int(os.getenv("PORT", 8080))
     uvicorn.run(app, host="0.0.0.0", port=port)
