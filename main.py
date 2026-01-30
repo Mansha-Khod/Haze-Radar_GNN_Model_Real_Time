@@ -27,6 +27,9 @@ FEATURE_COLS = [
     "avg_fire_confidence", "upwind_fire_count", "population_density"
 ]
 
+# Extended features include temporal encoding
+EXTENDED_FEATURE_COLS = FEATURE_COLS + ["hour_sin", "hour_cos", "is_rush_hour"]
+
 FORECAST_HOURS = [0, 6, 12, 18, 24, 30, 36, 42, 48, 54, 60, 66, 72]
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
@@ -217,9 +220,12 @@ class ModelManager:
         with open(NORM_STATS_PATH, 'r') as f:
             self.norm_stats = json.load(f)
         
+        # Determine number of features from normalization stats
+        num_features = len(self.norm_stats["feature_mean"])
+        
         # Initialize model
         self.model = HazeForecastGNN(
-            in_features=len(FEATURE_COLS),
+            in_features=num_features,
             hidden_dim=128,
             num_heads=4,
             dropout=0.2
@@ -230,7 +236,7 @@ class ModelManager:
         self.model.load_state_dict(state_dict)
         self.model.eval()
         
-        logger.info("Model loaded successfully")
+        logger.info(f"Model loaded successfully (features: {num_features})")
     
     def fetch_current_data(self) -> Dict:
         """Fetch latest data from Supabase"""
@@ -271,13 +277,24 @@ class ModelManager:
         
         CRITICAL: Does NOT include current PM2.5 as a feature!
         This prevents the compounding prediction bug.
+        
+        Includes temporal features to handle day/night patterns.
         """
-        feature_matrix = np.zeros((len(self.cities), len(FEATURE_COLS)), dtype=np.float32)
+        feature_matrix = np.zeros((len(self.cities), len(EXTENDED_FEATURE_COLS)), dtype=np.float32)
+        
+        # Calculate the predicted hour
+        predicted_hour = (datetime.now() + timedelta(hours=hour_offset)).hour
+        
+        # Temporal features (same for all cities at this hour)
+        hour_sin = np.sin(2 * np.pi * predicted_hour / 24)
+        hour_cos = np.cos(2 * np.pi * predicted_hour / 24)
+        is_rush_hour = 1.0 if (7 <= predicted_hour <= 9 or 17 <= predicted_hour <= 19) else 0.0
         
         for i, city in enumerate(self.cities):
             if city not in city_data:
                 # Use defaults if no data
-                feature_matrix[i] = [26.0, 80.0, 3.0, 180.0, 0.0, 0.0, 5000.0]
+                feature_matrix[i] = [26.0, 80.0, 3.0, 180.0, 0.0, 0.0, 5000.0, 
+                                    hour_sin, hour_cos, is_rush_hour]
                 continue
             
             # Get weather forecast for this hour
@@ -298,7 +315,10 @@ class ModelManager:
                 weather.get("wind_direction", 180.0),
                 current_data.get("avg_fire_confidence", 0.0),
                 current_data.get("upwind_fire_count", 0.0),
-                current_data.get("population_density", 5000.0)
+                current_data.get("population_density", 5000.0),
+                hour_sin,
+                hour_cos,
+                is_rush_hour
             ]
         
         return feature_matrix
