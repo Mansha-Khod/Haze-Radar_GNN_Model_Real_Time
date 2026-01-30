@@ -1,5 +1,5 @@
 {
-  "model": "GATv2 PM2.5 Forecasting GNN - West Java",
+  "model": "GATv2 PM2.5 Forecasting GNN - West Java (v2 with temporal features)",
   "training_date": "2026-01-30",
   "features": [
     "temperature",
@@ -8,7 +8,24 @@
     "wind_direction",
     "avg_fire_confidence",
     "upwind_fire_count",
+    "population_density",
+    "hour_sin",
+    "hour_cos",
+    "is_rush_hour"
+  ],
+  "base_features": [
+    "temperature",
+    "humidity",
+    "wind_speed",
+    "wind_direction",
+    "avg_fire_confidence",
+    "upwind_fire_count",
     "population_density"
+  ],
+  "temporal_features": [
+    "hour_sin",
+    "hour_cos",
+    "is_rush_hour"
   ],
   "target": "PM2.5 6 hours ahead",
   "num_cities": 10,
@@ -16,5 +33,5 @@
   "normalization": "z-score (mean/std)",
   "loss": "MSE + Uncertainty",
   "prediction_horizon_hours": 6,
-  "notes": "Model predicts FUTURE PM2.5, not current values"
+  "notes": "Model predicts FUTURE PM2.5 with temporal features to handle day/night cycles"
 }
