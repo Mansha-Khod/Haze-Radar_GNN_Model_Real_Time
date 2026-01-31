@@ -271,15 +271,12 @@ class ModelManager:
             logger.error(f"Supabase fetch failed: {e}")
             return {}
     
-    def build_feature_matrix(self, city_data: Dict, hour_offset: int = 0, 
-                            prev_predictions: Optional[np.ndarray] = None) -> np.ndarray:
+    def build_feature_matrix(self, city_data: Dict, hour_offset: int = 0) -> np.ndarray:
         """
         Build feature matrix for all cities at a given time offset.
         
-        CRITICAL: Includes previous PM2.5 prediction as persistence feature.
-        This allows the model to predict small changes (delta) from current state.
-        
         Includes temporal features to handle day/night patterns.
+        Uses current PM2.5 as anchor for stability.
         """
         feature_matrix = np.zeros((len(self.cities), len(EXTENDED_FEATURE_COLS)), dtype=np.float32)
         
@@ -294,9 +291,9 @@ class ModelManager:
         for i, city in enumerate(self.cities):
             if city not in city_data:
                 # Use defaults if no data
-                pm25_persistence = 30.0  # Default PM2.5
+                pm25_baseline = 30.0  # Default PM2.5
                 feature_matrix[i] = [26.0, 80.0, 3.0, 180.0, 0.0, 0.0, 5000.0, 
-                                    hour_sin, hour_cos, is_rush_hour, pm25_persistence]
+                                    hour_sin, hour_cos, is_rush_hour, pm25_baseline]
                 continue
             
             # Get weather forecast for this hour
@@ -310,13 +307,9 @@ class ModelManager:
             # Build feature vector
             current_data = city_data[city]
             
-            # CRITICAL: Use previous prediction as persistence
-            if prev_predictions is not None and hour_offset > 0:
-                # Use previous prediction (from 6 hours ago)
-                pm25_persistence = float(prev_predictions[i])
-            else:
-                # For hour 0, use current actual PM2.5
-                pm25_persistence = current_data.get("current_pm25", 30.0)
+            # CRITICAL: Always use CURRENT actual PM2.5 as baseline
+            # Model will learn to predict small deviations from this
+            pm25_baseline = current_data.get("current_pm25", 30.0)
             
             feature_matrix[i] = [
                 weather.get("temperature", 26.0),
@@ -329,7 +322,7 @@ class ModelManager:
                 hour_sin,
                 hour_cos,
                 is_rush_hour,
-                pm25_persistence  # PERSISTENCE FEATURE
+                pm25_baseline  # ALWAYS current PM2.5, not previous prediction
             ]
         
         return feature_matrix
@@ -425,22 +418,27 @@ class ModelManager:
                     continue
                 
                 forecast = []
-                prev_prediction = None
+                city_idx = self.city_to_idx[city]
+                
+                # Get current PM2.5 as baseline
+                current_pm25 = city_data[city].get("current_pm25", 30.0)
                 
                 for hour in FORECAST_HOURS:
-                    # Get features for this future hour (with previous prediction as persistence)
-                    features = self.build_feature_matrix(city_data, hour_offset=hour, 
-                                                        prev_predictions=prev_prediction)
-                    pm25_pred, unc_pred = self.predict(features)
+                    # Get features for this future hour (always using current PM2.5 as baseline)
+                    features = self.build_feature_matrix(city_data, hour_offset=hour)
+                    pm25_pred_raw, unc_pred = self.predict(features)
                     
-                    # Store prediction for next iteration
-                    prev_prediction = pm25_pred.copy()
+                    pm25_raw = float(pm25_pred_raw[city_idx])
                     
-                    city_idx = self.city_to_idx[city]
-                    pm25 = float(pm25_pred[city_idx])
+                    # ENSEMBLE: Blend GNN prediction with persistence
+                    # Weight decreases with forecast horizon
+                    persistence_weight = max(0.3, 1.0 - (hour / 72.0) * 0.7)  # 100% at h=0 to 30% at h=72
+                    gnn_weight = 1.0 - persistence_weight
+                    
+                    pm25_ensemble = (persistence_weight * current_pm25) + (gnn_weight * pm25_raw)
                     
                     # Clamp predictions to reasonable range
-                    pm25 = max(5.0, min(pm25, 150.0))
+                    pm25 = max(5.0, min(pm25_ensemble, 150.0))
                     
                     uncertainty = float(unc_pred[city_idx])
                     aqi = pm25_to_aqi(pm25)
