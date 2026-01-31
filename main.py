@@ -27,8 +27,8 @@ FEATURE_COLS = [
     "avg_fire_confidence", "upwind_fire_count", "population_density"
 ]
 
-# Extended features include temporal encoding
-EXTENDED_FEATURE_COLS = FEATURE_COLS + ["hour_sin", "hour_cos", "is_rush_hour"]
+# Extended features include temporal encoding AND current PM2.5 for persistence
+EXTENDED_FEATURE_COLS = FEATURE_COLS + ["hour_sin", "hour_cos", "is_rush_hour", "current_pm25"]
 
 FORECAST_HOURS = [0, 6, 12, 18, 24, 30, 36, 42, 48, 54, 60, 66, 72]
 
@@ -271,12 +271,13 @@ class ModelManager:
             logger.error(f"Supabase fetch failed: {e}")
             return {}
     
-    def build_feature_matrix(self, city_data: Dict, hour_offset: int = 0) -> np.ndarray:
+    def build_feature_matrix(self, city_data: Dict, hour_offset: int = 0, 
+                            prev_predictions: Optional[np.ndarray] = None) -> np.ndarray:
         """
         Build feature matrix for all cities at a given time offset.
         
-        CRITICAL: Does NOT include current PM2.5 as a feature!
-        This prevents the compounding prediction bug.
+        CRITICAL: Includes previous PM2.5 prediction as persistence feature.
+        This allows the model to predict small changes (delta) from current state.
         
         Includes temporal features to handle day/night patterns.
         """
@@ -293,8 +294,9 @@ class ModelManager:
         for i, city in enumerate(self.cities):
             if city not in city_data:
                 # Use defaults if no data
+                pm25_persistence = 30.0  # Default PM2.5
                 feature_matrix[i] = [26.0, 80.0, 3.0, 180.0, 0.0, 0.0, 5000.0, 
-                                    hour_sin, hour_cos, is_rush_hour]
+                                    hour_sin, hour_cos, is_rush_hour, pm25_persistence]
                 continue
             
             # Get weather forecast for this hour
@@ -308,6 +310,14 @@ class ModelManager:
             # Build feature vector
             current_data = city_data[city]
             
+            # CRITICAL: Use previous prediction as persistence
+            if prev_predictions is not None and hour_offset > 0:
+                # Use previous prediction (from 6 hours ago)
+                pm25_persistence = float(prev_predictions[i])
+            else:
+                # For hour 0, use current actual PM2.5
+                pm25_persistence = current_data.get("current_pm25", 30.0)
+            
             feature_matrix[i] = [
                 weather.get("temperature", 26.0),
                 weather.get("humidity", 80.0),
@@ -318,7 +328,8 @@ class ModelManager:
                 current_data.get("population_density", 5000.0),
                 hour_sin,
                 hour_cos,
-                is_rush_hour
+                is_rush_hour,
+                pm25_persistence  # PERSISTENCE FEATURE
             ]
         
         return feature_matrix
@@ -414,14 +425,23 @@ class ModelManager:
                     continue
                 
                 forecast = []
+                prev_prediction = None
                 
                 for hour in FORECAST_HOURS:
-                    # Get features for this future hour
-                    features = self.build_feature_matrix(city_data, hour_offset=hour)
+                    # Get features for this future hour (with previous prediction as persistence)
+                    features = self.build_feature_matrix(city_data, hour_offset=hour, 
+                                                        prev_predictions=prev_prediction)
                     pm25_pred, unc_pred = self.predict(features)
+                    
+                    # Store prediction for next iteration
+                    prev_prediction = pm25_pred.copy()
                     
                     city_idx = self.city_to_idx[city]
                     pm25 = float(pm25_pred[city_idx])
+                    
+                    # Clamp predictions to reasonable range
+                    pm25 = max(5.0, min(pm25, 150.0))
+                    
                     uncertainty = float(unc_pred[city_idx])
                     aqi = pm25_to_aqi(pm25)
                     
