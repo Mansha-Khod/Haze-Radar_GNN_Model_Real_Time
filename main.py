@@ -413,6 +413,10 @@ class ModelManager:
             logger.info("Building forecasts...")
             self.city_forecasts = {}
             
+            # First, get CURRENT predictions to use as baseline
+            features_now = self.build_feature_matrix(city_data, hour_offset=0)
+            pm25_current, _ = self.predict(features_now)
+            
             for city in self.cities:
                 if city not in city_data:
                     continue
@@ -420,8 +424,11 @@ class ModelManager:
                 forecast = []
                 city_idx = self.city_to_idx[city]
                 
-                # Get current PM2.5 as baseline
-                current_pm25 = city_data[city].get("current_pm25", 30.0)
+                # CRITICAL FIX: Use CURRENT PREDICTION as baseline, not stale Supabase data
+                current_pm25 = float(pm25_current[city_idx])
+                current_pm25 = max(5.0, min(current_pm25, 150.0))  # Clamp to reasonable range
+                
+                logger.info(f"Forecasting {city}: baseline PM2.5 = {current_pm25:.2f}")
                 
                 for hour in FORECAST_HOURS:
                     # Get features for this future hour (always using current PM2.5 as baseline)
