@@ -398,6 +398,7 @@ class ModelManager:
                     "aqi": round(predicted_aqi, 1),
                     "uncertainty": round(uncertainty, 2),
                     "status": status,
+                    "category": status,
                     "temperature": round(weather_now.get("temperature", 26.0), 1),
                     "latitude": coords.get("lat"),
                     "longitude": coords.get("lon"),
@@ -536,6 +537,7 @@ class CityPrediction(BaseModel):
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     timestamp: str
+    category: str = None
 
 
 class ForecastPoint(BaseModel):
