@@ -607,5 +607,7 @@ async def refresh_predictions():
 
 if __name__ == "__main__":
     import uvicorn
+    import os
     port = int(os.getenv("PORT", 8080))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    print(f"Starting server on port {port}")
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
