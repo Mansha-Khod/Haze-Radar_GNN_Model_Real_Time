@@ -519,7 +519,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://haze-radar-team-23.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
